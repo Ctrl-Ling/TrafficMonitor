@@ -555,6 +555,67 @@ static int ValidateHook()
     }
 }
 
+//地址开头的 24 字节 -> 十六进制字符串（读不到写 NA）。out 至少 49 个 wchar_t。
+static void BytesToHex(void* address, wchar_t* out)
+{
+    static constexpr size_t kDumpBytes = 24;
+    static constexpr wchar_t kHex[] = L"0123456789ABCDEF";
+    unsigned char bytes[kDumpBytes]{};
+    const size_t read = ReadTargetBytes(address, bytes, kDumpBytes);
+    if (read == 0)
+    {
+        out[0] = L'N';
+        out[1] = L'A';
+        out[2] = L'\0';
+        return;
+    }
+    size_t pos = 0;
+    for (size_t n = 0; n < read; n++)
+    {
+        out[pos++] = kHex[bytes[n] >> 4];
+        out[pos++] = kHex[bytes[n] & 0x0F];
+    }
+    out[pos] = L'\0';
+}
+
+//把挂钩现场写进注册表（TaskbarSplitPrologue）：
+//S: = 虚表槽里那个地址的开头字节；T: = 真正下补丁的地址（穿过了开头的 jmp 时两者才不同）。
+//装成功时 T: 会是 FF2500000000+地址，正好证明补丁还在；装失败时它就是卡住的那段原始指令。
+static void PublishPrologue(void* slot_address, const InlineDetour& detour)
+{
+    wchar_t slot_hex[64]{}, target_hex[64]{};
+    BytesToHex(slot_address, slot_hex);
+    wchar_t text[160]{};
+    size_t pos = 0;
+    auto append = [&](const wchar_t* s) { while (*s != L'\0') text[pos++] = *s++; };
+    append(L"S:");
+    append(slot_hex);
+    if (detour.target != nullptr && detour.target != slot_address)
+    {
+        BytesToHex(detour.target, target_hex);
+        append(L" T:");
+        append(target_hex);
+    }
+    text[pos] = L'\0';
+    SplitRegWriteStringIfChanged(kRegPrologue, text);
+}
+
+//内联跳转的失败岔口 -> 进度码（23*10 + 原因号），插件那边一一对上中文
+static DWORD DetourFailToStep(DetourFail fail)
+{
+    switch (fail)
+    {
+    case kDetourFailBadArgs:        return kStepDetourBadArgs;
+    case kDetourFailUnreadable:     return kStepDetourUnreadable;
+    case kDetourFailBadInstruction: return kStepDetourBadInstruction;
+    case kDetourFailTooLong:        return kStepDetourTooLong;
+    case kDetourFailFarTarget:      return kStepDetourFarTarget;
+    case kDetourFailNoMemory:       return kStepDetourNoMemory;
+    case kDetourFailProtect:        return kStepDetourProtect;
+    }
+    return kStepDetourFailed;
+}
+
 bool InstallTaskbarSplit()
 {
     if (g_hook_installed.load())
@@ -582,16 +643,22 @@ bool InstallTaskbarSplit()
         return false;
     }
 
-    if (!InstallInlineDetour(g_detour, arrange_address, reinterpret_cast<void*>(&ArrangeHook)))
+    DetourFail detour_fail = kDetourFailNone;
+    const bool detour_ok = InstallInlineDetour(g_detour, arrange_address, reinterpret_cast<void*>(&ArrangeHook), &detour_fail);
+    //不管成没成，都把挂钩现场的字节写进注册表：
+    //出错时凭这串十六进制就能离线还原现场，不用再盲改一轮。
+    PublishPrologue(arrange_address, g_detour);
+
+    if (!detour_ok)
     {
-        SplitRegWriteDwordIfChanged(kRegStep, kStepDetourFailed);
+        SplitRegWriteDwordIfChanged(kRegStep, DetourFailToStep(detour_fail));
         return false;
     }
     g_arrange_original = reinterpret_cast<Arrange_func>(g_detour.trampoline);
     if (g_arrange_original == nullptr)
     {
         RestoreDetourBytes();
-        SplitRegWriteDwordIfChanged(kRegStep, kStepDetourFailed);
+        SplitRegWriteDwordIfChanged(kRegStep, kStepDetourNoMemory);
         return false;
     }
 

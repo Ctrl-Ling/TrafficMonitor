@@ -25,6 +25,7 @@ static constexpr const wchar_t* kRegPid = L"TaskbarSplitPid";           //REG_DW
 static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的宽度，单位 1/100 DIP
 static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ 调试信息：助手在任务栏上看到的控件类型名
 static constexpr const wchar_t* kRegStep = L"TaskbarSplitStep";         //REG_DWORD 助手走到哪一步了（见下面的 kStep*），插件选项对话框直接显示这句话
+static constexpr const wchar_t* kRegPrologue = L"TaskbarSplitPrologue"; //REG_SZ 挂钩点函数开头 24 字节的十六进制，出错时靠它还原现场（reg query 就能看到）
 
 // 助手的进度码：挂钩这件事跨了两个进程，出错时只看“没生效”没法定位，
 // 所以每过一个里程碑就写一个数，插件把数字翻译成中文显示出来。
@@ -34,11 +35,22 @@ static constexpr DWORD kStepHookRan = 10;           //消息钩子进了 explore
 static constexpr DWORD kStepRequestSeen = 20;       //读到开关=1，准备装挂钩
 static constexpr DWORD kStepProbeObjectFailed = 21; //建 XAML 探针对象失败（这个线程里拿不到 XAML 运行时）
 static constexpr DWORD kStepSlotNotXaml = 22;       //槽位里的地址不在 XAML 模块里（这个系统版本上槽位不对）
-static constexpr DWORD kStepDetourFailed = 23;      //内联跳转装不上（函数开头指令看不懂 / 附近没有可执行内存）
+static constexpr DWORD kStepDetourFailed = 23;      //内联跳转装不上（具体原因看下面的 23x，老数据可能只写到 23）
 static constexpr DWORD kStepSelfCallMissed = 24;    //自检失败：调用该槽位没进我们的函数
 static constexpr DWORD kStepTrampolineFailed = 25;  //自检失败：搬走的指令在 trampoline 上跑不动
 static constexpr DWORD kStepHookInstalled = 30;     //挂钩装好且自检通过
 static constexpr DWORD kStepPinning = 40;           //真的任务栏按钮经过了挂钩，正在钉住
+
+//“内联跳转装不上”的细分原因：23*10 + detour.h 里 DetourFail 的值。
+//装不上可能是指令看不懂、附近没有可执行内存、权限改不动……差一个字段的处理完全不同，
+//所以把岔口一一编号；配合 TaskbarSplitPrologue 里的原始字节就能离线判断卡在哪。
+static constexpr DWORD kStepDetourBadArgs = 231;        //要挂钩的地址或钩子函数地址是空的
+static constexpr DWORD kStepDetourUnreadable = 232;     //函数所在内存读不到（不是已提交的代码页）
+static constexpr DWORD kStepDetourBadInstruction = 233; //函数开头有不认识的指令，不敢搬
+static constexpr DWORD kStepDetourTooLong = 234;        //函数开头指令太长/太多，搬不动
+static constexpr DWORD kStepDetourFarTarget = 235;      //搬走后相对地址重算超范围（trampoline 离得太远）
+static constexpr DWORD kStepDetourNoMemory = 236;       //找不到能用的可执行内存
+static constexpr DWORD kStepDetourProtect = 237;        //VirtualProtect 改不动代码页的写权限
 
 // 助手 DLL 的文件名。它不是 TM 插件，必须和 plugins 目录分开（否则 TM 的插件管理会去
 // 找它的 TMPluginGetInstance 并报“函数获取失败 127”），放在 TrafficMonitor.exe 同级目录。
@@ -117,6 +129,19 @@ inline bool SplitRegWriteString(const wchar_t* name, const wchar_t* value)
     bool ok = (::RegSetValueExW(h_key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value), bytes) == ERROR_SUCCESS);
     ::RegCloseKey(h_key);
     return ok;
+}
+
+//和 SplitRegWriteDwordIfChanged 同理：两边都用 RegNotifyChangeKeyValue 监视同一个键，
+//写一遍一模一样的字符串也会把写它自己叫醒一次，所以助手上报前先看有没有真的变。
+inline bool SplitRegWriteStringIfChanged(const wchar_t* name, const wchar_t* value)
+{
+    wchar_t current[256]{};
+    if (SplitRegReadString(name, current, sizeof(current) / sizeof(current[0])))
+    {
+        if (::lstrcmpW(current, value) == 0)
+            return true;
+    }
+    return SplitRegWriteString(name, value);
 }
 
 
