@@ -5,6 +5,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+//WIN32_LEAN_AND_MEAN 会让 windows.h 不拉进 ole2.h/unknwn.h，于是 IUnknown 只剩下
+//winrt/base.h 里那句前向声明（不完整类型），调 QueryInterface 就报
+//C2027: use of undefined type 'IUnknown'。这里显式把定义补回来。
+#include <unknwn.h>
+
 //Windows 头和 C++/WinRT 撞名的宏（winrt 的头里会报 C4002）
 #ifdef GetCurrentTime
 #undef GetCurrentTime
