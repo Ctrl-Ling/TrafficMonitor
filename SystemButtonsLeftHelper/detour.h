@@ -26,7 +26,8 @@ enum DetourFail
     kDetourFailTooLong = 4,       //开头指令太长，搬不动
     kDetourFailFarTarget = 5,     //重算后的相对地址放不下
     kDetourFailNoMemory = 6,      //找不到能用的可执行内存
-    kDetourFailProtect = 7        //VirtualProtect 改不动写权限
+    kDetourFailProtect = 7,       //VirtualProtect 改不动写权限
+    kDetourFailNotWritten = 8     //写完跳回读，字节没变（代码页写不进去 / 被保护）
 };
 
 struct InlineDetour
@@ -49,7 +50,12 @@ bool IsReadableCodeAddress(void* address);
 
 //把 target 开头若干指令搬到 trampoline 上（相对地址按新位置重算），
 //并在 target 处写入 jmp [rip+0]; addr。fail_reason 为空时只回 true/false。
-bool InstallInlineDetour(InlineDetour& detour, void* target, void* hook, DetourFail* fail_reason = nullptr);
+//follow_thunks=false（默认）：补丁就打在 target 这个地址上 —— 虚表槽指哪就打哪，
+//  这样“通过槽位调用”一定走进我们的钩子（实测打过一次“顺着 jmp 打到真身”，
+//  结果自检时调用槽位根本没进钩子，说明那个 jmp 的目标并不是调用真正去的地方）。
+//follow_thunks=true：先穿过开头的 jmp，把补丁打在它指向的实现上（开头搬不动时的退路）。
+bool InstallInlineDetour(InlineDetour& detour, void* target, void* hook, DetourFail* fail_reason = nullptr,
+                         bool follow_thunks = false);
 
 //还原 target 的原始字节（trampoline 故意不释放：可能还有线程停在里面）
 void RemoveInlineDetour(InlineDetour& detour);

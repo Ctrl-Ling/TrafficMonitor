@@ -282,16 +282,16 @@ struct ProloguePlan
 };
 
 //从头走完整指令直到覆盖够 kPatchSize；只有在不认识指令、或指令条数超上限时才失败
-static bool BuildPrologue(const unsigned char* code, ProloguePlan& plan)
+static bool BuildPrologue(const unsigned char* code, size_t window, ProloguePlan& plan)
 {
     plan = ProloguePlan{};
     size_t offset = 0;
     while (offset < kPatchSize)
     {
-        if (plan.count >= kMaxPrologueInstrs || offset >= kCodeWindow)
+        if (plan.count >= kMaxPrologueInstrs || offset >= window)
             return false;
         InstrInfo info;
-        if (!DecodeOne(code + offset, kCodeWindow - offset, info))
+        if (!DecodeOne(code + offset, window - offset, info))
             return false;
         plan.instrs[plan.count++] = info;
         if (info.disp_size != 0)
@@ -468,7 +468,7 @@ static size_t EmitJumpBack(unsigned char* dst, uintptr_t dst_base, size_t dst_of
     return 14;
 }
 
-bool InstallInlineDetour(InlineDetour& detour, void* target, void* hook, DetourFail* fail_reason)
+bool InstallInlineDetour(InlineDetour& detour, void* target, void* hook, DetourFail* fail_reason, bool follow_thunks)
 {
     detour = InlineDetour{};
     detour.slot_address = target;
@@ -484,17 +484,19 @@ bool InstallInlineDetour(InlineDetour& detour, void* target, void* hook, DetourF
     }
     else
     {
-        void* real_target = ResolveFunctionThunk(target);
+        //默认就在槽位指向的地址上下补丁；只有调用方明确要求（比如这里开头实在搬不动）才穿过 jmp
+        void* real_target = follow_thunks ? ResolveFunctionThunk(target) : target;
         detour.target = real_target;
         detour.thunk_followed = (real_target != target);
 
         unsigned char code_bytes[kCodeWindow]{};
         ProloguePlan plan;
-        if (ReadTargetBytes(real_target, code_bytes, sizeof(code_bytes)) < kPatchSize)
+        const size_t readable = ReadTargetBytes(real_target, code_bytes, sizeof(code_bytes));
+        if (readable < kPatchSize)
         {
             fail = kDetourFailUnreadable;
         }
-        else if (!BuildPrologue(code_bytes, plan))
+        else if (!BuildPrologue(code_bytes, readable, plan))
         {
             fail = kDetourFailBadInstruction;
         }
@@ -561,8 +563,34 @@ bool InstallInlineDetour(InlineDetour& detour, void* target, void* hook, DetourF
                         memcpy(dst + 6, &hook_addr, sizeof(hook_addr));
                         ::VirtualProtect(real_target, overwritten, old_protect, &old_protect);
                         ::FlushInstructionCache(::GetCurrentProcess(), real_target, overwritten);
-                        detour.installed = true;
-                        fail = kDetourFailNone;
+
+                        //写完读回来核对：有的环境执行页根本写不进去（或写进去又被还原），
+                        //这种情况绝不能当成“装好了”，否则后面每一步都是在猜。
+                        unsigned char verify[kPatchSize]{};
+                        bool patch_live = ReadTargetBytes(real_target, verify, sizeof(verify)) >= kPatchSize;
+                        if (patch_live)
+                        {
+                            uint64_t written_addr{};
+                            memcpy(&written_addr, verify + 6, sizeof(written_addr));
+                            patch_live = (verify[0] == 0xFF && verify[1] == 0x25 && written_addr == hook_addr);
+                        }
+                        if (!patch_live)
+                        {
+                            DWORD revert_protect{};
+                            if (::VirtualProtect(real_target, overwritten, PAGE_EXECUTE_READWRITE, &revert_protect))
+                            {
+                                memcpy(real_target, detour.saved_bytes, overwritten);
+                                ::VirtualProtect(real_target, overwritten, revert_protect, &revert_protect);
+                                ::FlushInstructionCache(::GetCurrentProcess(), real_target, overwritten);
+                            }
+                            detour.overwritten_length = 0;
+                            fail = kDetourFailNotWritten;
+                        }
+                        else
+                        {
+                            detour.installed = true;
+                            fail = kDetourFailNone;
+                        }
                     }
                 }
             }

@@ -11,6 +11,7 @@
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.Shapes.h>
 #include <cwctype>
+#include <cstdio>       //swprintf_s：把自检现场拼成一句话写进注册表
 #include <mutex>
 
 using namespace winrt;
@@ -523,6 +524,33 @@ static bool SafeCall(Arrange_func func, void* abi, Rect rect, HRESULT* hr)
     }
 }
 
+//自检现场写进注册表（TaskbarSplitSelfTest）：哪一步、计数加了几、返回码。
+//“没进钩子”和“进了钩子但跑飞了”看着都是“没生效”，做法却完全相反，只能靠这两个数字分。
+static void PublishSelfTest(const wchar_t* stage, long call_delta, HRESULT hr)
+{
+    wchar_t text[128]{};
+    ::swprintf_s(text, L"%s calls=%ld hr=0x%08lX", stage, call_delta, static_cast<unsigned long>(hr));
+    SplitRegWriteStringIfChanged(kRegSelfTest, text);
+}
+
+//槽地址和实际下补丁的地址一起写出来：两者不一致，就说明调用根本不走我们改的地方。
+//M:=槽地址所在模块的加载基址 —— S 减 M 就是这个函数在这个 dll 里的偏移，
+//拿这个偏移去查微软公开符号（dbghelp SymFromAddr）就能直接问出“槽位 92 到底叫什么名字”。
+static void PublishTargetAddresses(void* slot_address, const InlineDetour& detour)
+{
+    uintptr_t module_base = 0;
+    HMODULE module{};
+    if (::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(slot_address), &module) && module != nullptr)
+        module_base = reinterpret_cast<uintptr_t>(module);
+    wchar_t text[160]{};
+    ::swprintf_s(text, L"S:0x%016llX T:0x%016llX M:0x%016llX",
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(slot_address)),
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(detour.target)),
+        static_cast<unsigned long long>(module_base));
+    SplitRegWriteStringIfChanged(kRegTarget, text);
+}
+
 //自检：通过“已经被改过的虚表槽”调用一次 Arrange，确认我们的函数真的被执行了，
 //并且原函数开头被搬走的指令在 trampoline 上还能正常跑完。
 //返回 0 = 通过；否则返回失败步骤码，由调用方写进注册表，插件那边直接显示成中文。
@@ -536,22 +564,36 @@ static int ValidateHook()
         void** vtable = *reinterpret_cast<void***>(&abi);
         Arrange_func slot = reinterpret_cast<Arrange_func>(vtable[kIUIElementArrangeSlot]);
 
-        long before = g_arrange_call_count.load();
+        const long before = g_arrange_call_count.load();
         HRESULT hr{};
-        //这一脚踩下去要么进我们的函数（计数 +1），要么直接崩；两种都算“没确认成功”
+        //这一脚踩下去要么进我们的函数（计数 +1），要么直接崩；两种都算“没确认成功”，但原因要分开报
         if (!SafeCall(slot, abi, Rect{ 0.0f, 0.0f, 40.0f, 40.0f }, &hr))
-            return static_cast<int>(kStepSelfCallMissed);
-        if (g_arrange_call_count.load() == before)
-            return static_cast<int>(kStepSelfCallMissed);       //没走进我们的函数，说明这个槽位不是（或者没生效）
+        {
+            PublishSelfTest(L"crash", g_arrange_call_count.load() - before, hr);
+            return static_cast<int>(kStepSelfCallCrashed);
+        }
+        const long delta = g_arrange_call_count.load() - before;
+        if (delta == 0)
+        {
+            //正常返回了却一次都没进我们的函数 = 补丁不在这条调用路径上
+            PublishSelfTest(L"nohook", delta, hr);
+            return static_cast<int>(kStepSelfCallNotHooked);
+        }
 
         //再直接走一遍 trampoline，确保搬走的指令是好的
         if (!SafeCall(g_arrange_original, abi, Rect{ 0.0f, 0.0f, 42.0f, 42.0f }, &hr))
+        {
+            PublishSelfTest(L"tramp", g_arrange_call_count.load() - before, hr);
             return static_cast<int>(kStepTrampolineFailed);
+        }
+        PublishSelfTest(L"ok", g_arrange_call_count.load() - before, hr);
         return 0;
     }
     catch (...)
     {
-        return static_cast<int>(kStepSelfCallMissed);
+        //建探针对象/取虚表就抛了，这个线程里的 XAML 运行时状态有问题
+        PublishSelfTest(L"cpp", 0, static_cast<HRESULT>(E_UNEXPECTED));
+        return static_cast<int>(kStepSelfCallThrew);
     }
 }
 
@@ -643,10 +685,17 @@ bool InstallTaskbarSplit()
         return false;
     }
 
+    //第一选择是“槽位指哪就打哪”：这样凡是走这个虚表槽的调用必定进我们的钩子。
+    //只有那里开头实在搬不动，才退一步穿过开头的 jmp 把补丁打到真身（实测打过一次真身，
+    //自检时调用虚表槽根本没进钩子 —— 说明那条 jmp 的目标不是调用真正去的地方）。
     DetourFail detour_fail = kDetourFailNone;
-    const bool detour_ok = InstallInlineDetour(g_detour, arrange_address, reinterpret_cast<void*>(&ArrangeHook), &detour_fail);
-    //不管成没成，都把挂钩现场的字节写进注册表：
-    //出错时凭这串十六进制就能离线还原现场，不用再盲改一轮。
+    void* const hook_address = reinterpret_cast<void*>(&ArrangeHook);
+    bool detour_ok = InstallInlineDetour(g_detour, arrange_address, hook_address, &detour_fail, false);
+    if (!detour_ok)
+        detour_ok = InstallInlineDetour(g_detour, arrange_address, hook_address, &detour_fail, true);
+    //不管成没成，都把挂钩现场（两处地址 + 两处开头字节）写进注册表：
+    //出错时凭这两串就能离线还原现场，不用再盲改一轮。
+    PublishTargetAddresses(arrange_address, g_detour);
     PublishPrologue(arrange_address, g_detour);
 
     if (!detour_ok)
