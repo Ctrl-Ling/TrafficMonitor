@@ -2,12 +2,15 @@
 #include "detour.h"
 #include <cstring>
 
-// x64 内联跳转：在目标函数开头写入 jmp [rip+0] + 8 字节绝对地址，共 14 字节。
-// 被覆盖的必须是整数条指令，所以实际覆盖长度是 >=14 的某个指令边界。
+// x64 内联跳转：优先在目标函数开头写 5 字节直接 jmp rel32（够得着钩子的时候），
+// 够不着（差值超 ±2GB）才退回 jmp [rip+0] + 8 字节绝对地址，共 14 字节。
+// 直接 jmp 不走间接分支，CPU 的 CET 着陆垫检查管不到它；而且只占 5 个字节，要搬走的原指令更少。
+// 被覆盖的必须是整数条指令，所以实际覆盖长度是 >=补丁长度的某个指令边界。
 // 搬走的指令里如果带相对地址（E8/E9/EB、0F 8x、rip 相对寻址），搬到 trampoline 后
 // “下一条指令的位置”变了，必须把位移重新算一遍；算完放不下就整个放弃。
 // 认不出来的一律返回失败，由调用方退回系统自带的“靠左”，绝不带着半懂的字节去改 explorer。
-static constexpr size_t kPatchSize = 14;
+static constexpr size_t kAbsPatchSize = 14;     //jmp [rip+0] + 绝对地址
+static constexpr size_t kRel32PatchSize = 5;    //jmp rel32
 
 enum : unsigned char
 {
@@ -272,6 +275,18 @@ static bool DecodeOne(const unsigned char* code, size_t available, InstrInfo& in
 
 static constexpr size_t kMaxPrologueInstrs = 12;
 static constexpr size_t kCodeWindow = 40;
+static constexpr size_t kEndBr64Length = 3;
+
+//入口的“着陆垫”：endbr64 = 0F 1E FA。开了 CET 的模块（explorer 里的微软组件基本都开），
+//凡是走虚表/函数指针的间接调用，CPU 会先检查目标地址的第一条指令是不是 endbr64；
+//不是就当场 #CP 控制保护异常。所以这 3 个字节绝对不能被我们的 jmp 覆盖：
+//补丁往后挪 3 字节打在它后面，trampoline 开头也原样搬一份（钩子调 trampoline 也是间接调用）。
+static size_t LandingPadLength(const unsigned char* code, size_t available)
+{
+    if (available >= kEndBr64Length && code[0] == 0x0F && code[1] == 0x1E && code[2] == 0xFA)
+        return kEndBr64Length;
+    return 0;
+}
 
 struct ProloguePlan
 {
@@ -281,12 +296,12 @@ struct ProloguePlan
     bool has_relative{};      //开头这段里有没有相对地址（有的话 trampoline 必须落在目标 ±2GB 内）
 };
 
-//从头走完整指令直到覆盖够 kPatchSize；只有在不认识指令、或指令条数超上限时才失败
-static bool BuildPrologue(const unsigned char* code, size_t window, ProloguePlan& plan)
+//从头走完整指令直到覆盖够 min_cover；只有在不认识指令、或指令条数超上限时才失败
+static bool BuildPrologue(const unsigned char* code, size_t window, size_t min_cover, ProloguePlan& plan)
 {
     plan = ProloguePlan{};
     size_t offset = 0;
-    while (offset < kPatchSize)
+    while (offset < min_cover)
     {
         if (plan.count >= kMaxPrologueInstrs || offset >= window)
             return false;
@@ -492,11 +507,21 @@ bool InstallInlineDetour(InlineDetour& detour, void* target, void* hook, DetourF
         unsigned char code_bytes[kCodeWindow]{};
         ProloguePlan plan;
         const size_t readable = ReadTargetBytes(real_target, code_bytes, sizeof(code_bytes));
-        if (readable < kPatchSize)
+        //入口是 endbr64 的话，补丁往后挪 3 字节打在它后面（见 LandingPadLength 的说明）
+        const size_t pad = LandingPadLength(code_bytes, readable);
+        detour.patch_offset = pad;
+        const uintptr_t src_base = reinterpret_cast<uintptr_t>(real_target);
+        //钩子离补丁点在 ±2GB 内就用 5 字节直接 jmp rel32：直接跳转不算间接分支，
+        //CET 的“目标必须是着陆垫”检查管不到它；够不着才用 14 字节 jmp [rip+0]+绝对地址。
+        const LONG64 rel32_delta = static_cast<LONG64>(reinterpret_cast<uintptr_t>(hook))
+            - (static_cast<LONG64>(src_base) + static_cast<LONG64>(pad) + static_cast<LONG64>(kRel32PatchSize));
+        const bool use_rel32 = (rel32_delta >= -2147483648LL && rel32_delta <= 2147483647LL);
+        const size_t patch_len = use_rel32 ? kRel32PatchSize : kAbsPatchSize;
+        if (readable < pad + patch_len)
         {
             fail = kDetourFailUnreadable;
         }
-        else if (!BuildPrologue(code_bytes, readable, plan))
+        else if (!BuildPrologue(code_bytes + pad, readable - pad, patch_len, plan))
         {
             fail = kDetourFailBadInstruction;
         }
@@ -508,9 +533,10 @@ bool InstallInlineDetour(InlineDetour& detour, void* target, void* hook, DetourF
         {
             const size_t overwritten = plan.total_length;
             detour.overwritten_length = overwritten;
-            const uintptr_t src_base = reinterpret_cast<uintptr_t>(real_target);
+            //真正下补丁的地址：入口 + 着陆垫
+            unsigned char* const patch_at = reinterpret_cast<unsigned char*>(src_base + pad);
 
-            const size_t tramp_size = overwritten + 16;
+            const size_t tramp_size = pad + overwritten + 16;
             void* tramp = nullptr;
             //指令里有相对地址时，trampoline 必须落在目标 ±2GB 内，否则重算后的位移放不下
             if (plan.has_relative)
@@ -521,69 +547,95 @@ bool InstallInlineDetour(InlineDetour& detour, void* target, void* hook, DetourF
             if (tramp == nullptr)
             {
                 detour.overwritten_length = 0;
+                detour.patch_offset = 0;
                 fail = kDetourFailNoMemory;
             }
             else
             {
                 const uintptr_t dst_base = reinterpret_cast<uintptr_t>(tramp);
                 unsigned char* dst = static_cast<unsigned char*>(tramp);
-                if (!RelocatePrologue(plan, code_bytes, dst, src_base, dst_base))
+                //trampoline 开头同样放着陆垫：钩子调原函数用的是函数指针，也是间接调用，CET 一样要查
+                if (pad != 0)
+                    memcpy(dst, code_bytes, pad);
+                if (!RelocatePrologue(plan, code_bytes + pad, dst + pad, src_base + pad, dst_base + pad))
                 {
                     ::VirtualFree(tramp, 0, MEM_RELEASE);
                     detour.overwritten_length = 0;
+                    detour.patch_offset = 0;
                     fail = kDetourFailFarTarget;
                 }
                 else
                 {
                     detour.trampoline = tramp;
-                    const size_t tail = EmitJumpBack(dst, dst_base, overwritten, src_base + overwritten);
-                    detour.trampoline_length = overwritten + tail;
+                    const size_t body = pad + overwritten;
+                    const size_t tail = EmitJumpBack(dst, dst_base, body, src_base + pad + overwritten);
+                    detour.trampoline_length = body + tail;
                     ::FlushInstructionCache(::GetCurrentProcess(), tramp, detour.trampoline_length);
 
                     DWORD old_protect{};
-                    if (!::VirtualProtect(real_target, overwritten, PAGE_EXECUTE_READWRITE, &old_protect))
+                    if (!::VirtualProtect(patch_at, overwritten, PAGE_EXECUTE_READWRITE, &old_protect))
                     {
                         ::VirtualFree(tramp, 0, MEM_RELEASE);
                         detour.trampoline = nullptr;
                         detour.overwritten_length = 0;
+                        detour.patch_offset = 0;
                         fail = kDetourFailProtect;
                     }
                     else
                     {
-                        memcpy(detour.saved_bytes, code_bytes, overwritten);
-                        //jmp [rip+0] + 8 字节绝对地址：不依赖相对距离，钩子函数在哪都能跳
-                        dst = static_cast<unsigned char*>(real_target);
-                        dst[0] = 0xFF;
-                        dst[1] = 0x25;
-                        dst[2] = 0;
-                        dst[3] = 0;
-                        dst[4] = 0;
-                        dst[5] = 0;
-                        const uint64_t hook_addr = reinterpret_cast<uint64_t>(hook);
-                        memcpy(dst + 6, &hook_addr, sizeof(hook_addr));
-                        ::VirtualProtect(real_target, overwritten, old_protect, &old_protect);
-                        ::FlushInstructionCache(::GetCurrentProcess(), real_target, overwritten);
+                        memcpy(detour.saved_bytes, code_bytes + pad, overwritten);
+                        dst = patch_at;
+                        const uintptr_t hook_addr = reinterpret_cast<uintptr_t>(hook);
+                        if (use_rel32)
+                        {
+                            //jmp rel32：只占 5 字节，而且是直接跳转 —— CPU 的间接分支着陆垫检查管不到它
+                            dst[0] = 0xE9;
+                            const int32_t d = static_cast<int32_t>(rel32_delta);
+                            memcpy(dst + 1, &d, sizeof(d));
+                        }
+                        else
+                        {
+                            //jmp [rip+0] + 8 字节绝对地址：不依赖相对距离，钩子函数在哪都能跳
+                            dst[0] = 0xFF;
+                            dst[1] = 0x25;
+                            dst[2] = 0;
+                            dst[3] = 0;
+                            dst[4] = 0;
+                            dst[5] = 0;
+                            const uint64_t abs_addr = static_cast<uint64_t>(hook_addr);
+                            memcpy(dst + 6, &abs_addr, sizeof(abs_addr));
+                        }
+                        ::VirtualProtect(patch_at, overwritten, old_protect, &old_protect);
+                        ::FlushInstructionCache(::GetCurrentProcess(), patch_at, overwritten);
 
                         //写完读回来核对：有的环境执行页根本写不进去（或写进去又被还原），
                         //这种情况绝不能当成“装好了”，否则后面每一步都是在猜。
-                        unsigned char verify[kPatchSize]{};
-                        bool patch_live = ReadTargetBytes(real_target, verify, sizeof(verify)) >= kPatchSize;
-                        if (patch_live)
+                        unsigned char verify[kAbsPatchSize]{};
+                        bool patch_live = ReadTargetBytes(patch_at, verify, patch_len) >= patch_len;
+                        if (patch_live && use_rel32)
+                        {
+                            int32_t d{};
+                            memcpy(&d, verify + 1, sizeof(d));
+                            patch_live = (verify[0] == 0xE9 && d == static_cast<int32_t>(rel32_delta));
+                        }
+                        else if (patch_live)
                         {
                             uint64_t written_addr{};
                             memcpy(&written_addr, verify + 6, sizeof(written_addr));
-                            patch_live = (verify[0] == 0xFF && verify[1] == 0x25 && written_addr == hook_addr);
+                            patch_live = (verify[0] == 0xFF && verify[1] == 0x25
+                                && written_addr == static_cast<uint64_t>(hook_addr));
                         }
                         if (!patch_live)
                         {
                             DWORD revert_protect{};
-                            if (::VirtualProtect(real_target, overwritten, PAGE_EXECUTE_READWRITE, &revert_protect))
+                            if (::VirtualProtect(patch_at, overwritten, PAGE_EXECUTE_READWRITE, &revert_protect))
                             {
-                                memcpy(real_target, detour.saved_bytes, overwritten);
-                                ::VirtualProtect(real_target, overwritten, revert_protect, &revert_protect);
-                                ::FlushInstructionCache(::GetCurrentProcess(), real_target, overwritten);
+                                memcpy(patch_at, detour.saved_bytes, overwritten);
+                                ::VirtualProtect(patch_at, overwritten, revert_protect, &revert_protect);
+                                ::FlushInstructionCache(::GetCurrentProcess(), patch_at, overwritten);
                             }
                             detour.overwritten_length = 0;
+                            detour.patch_offset = 0;
                             fail = kDetourFailNotWritten;
                         }
                         else
@@ -604,14 +656,15 @@ bool InstallInlineDetour(InlineDetour& detour, void* target, void* hook, DetourF
 
 void RemoveInlineDetour(InlineDetour& detour)
 {
-    if (detour.target != nullptr && detour.overwritten_length > 0)
+    void* const patch_at = DetourPatchAddress(detour);
+    if (patch_at != nullptr && detour.overwritten_length > 0)
     {
         DWORD old_protect{};
-        if (::VirtualProtect(detour.target, detour.overwritten_length, PAGE_EXECUTE_READWRITE, &old_protect))
+        if (::VirtualProtect(patch_at, detour.overwritten_length, PAGE_EXECUTE_READWRITE, &old_protect))
         {
-            memcpy(detour.target, detour.saved_bytes, detour.overwritten_length);
-            ::VirtualProtect(detour.target, detour.overwritten_length, old_protect, &old_protect);
-            ::FlushInstructionCache(::GetCurrentProcess(), detour.target, detour.overwritten_length);
+            memcpy(patch_at, detour.saved_bytes, detour.overwritten_length);
+            ::VirtualProtect(patch_at, detour.overwritten_length, old_protect, &old_protect);
+            ::FlushInstructionCache(::GetCurrentProcess(), patch_at, detour.overwritten_length);
         }
     }
     detour.installed = false;

@@ -12,8 +12,14 @@
 //   3）函数开头如果只是一串 jmp（编译器/CET 的跳转表、加载器打补丁留下的），
 //      先顺着 jmp 走到真正的实现，在真实现上下补丁；
 //   4）地址大小前缀 0x67、三段式 opcode（0F 38/3A）、moffs 之类一律认不出来就失败；
-//   5）安装后由调用方自己跑一次“验证调用”，失败就还原；
-//   6）还原只是一次字节写回，模块卸载前（DllMain）一定会执行。
+//   5）入口的着陆垫 endbr64（0F 1E FA）绝不覆盖：CET 开启的模块里，虚表这种间接调用
+//      要求目标地址第一条指令就是 endbr64，覆盖掉会当场触发控制保护异常（还没进钩子就崩）。
+//      有着陆垫时补丁打在它后面 3 字节，trampoline 也把它原样搬一份放最前面；
+//   6）安装后由调用方自己跑一次“验证调用”，失败就还原；
+//   7）还原只是一次字节写回，模块卸载前（DllMain）一定会执行。
+//   8）钩子离补丁点 ±2GB 内时优先写 5 字节直接 jmp rel32：直接跳转不是间接分支，
+//      不吃 CET 的着陆垫检查，占的字节也少（要搬走的原指令更少，更容易搬）；
+//      够不着才用 14 字节 jmp [rip+0]+绝对地址。
 
 //失败原因。内联跳转这条路上有好几个岔口，跨进程挂钩出错时只能靠这个数说话，
 //助手会把它换算成 23x 进度码写进注册表，插件选项框直接翻译成中文显示。
@@ -32,12 +38,13 @@ enum DetourFail
 
 struct InlineDetour
 {
-    void* target{};                       //真正被改写的地址（可能已经顺着开头的 jmp 往后挪了）
+    void* target{};                       //真正被改写的函数入口（可能已经顺着开头的 jmp 往后挪了）
     void* slot_address{};                 //调用方最初给我们的地址（虚表槽里那个）
     bool  thunk_followed{ false };        //是否穿过了开头的 jmp
-    unsigned char saved_bytes[32]{};      //原来的字节
-    size_t overwritten_length{};          //被覆盖了多少字节（>=14）
-    void* trampoline{};                   //可执行内存：搬过去的原指令（位移已修正）+ 跳回目标
+    size_t patch_offset{};                //补丁离入口的偏移：入口是 endbr64 时 =3（着陆垫不能覆盖）
+    unsigned char saved_bytes[32]{};      //被覆盖那段原来的字节
+    size_t overwritten_length{};          //被覆盖了多少字节（>=5，且正好是整数条指令）
+    void* trampoline{};                   //可执行内存：着陆垫 + 搬过去的原指令（位移已修正）+ 跳回目标
     size_t trampoline_length{};
     bool installed{ false };
 };
@@ -49,7 +56,7 @@ size_t ReadTargetBytes(void* address, unsigned char* buffer, size_t count);
 bool IsReadableCodeAddress(void* address);
 
 //把 target 开头若干指令搬到 trampoline 上（相对地址按新位置重算），
-//并在 target 处写入 jmp [rip+0]; addr。fail_reason 为空时只回 true/false。
+//并在补丁点写入 jmp rel32（够得着钩子时）或 jmp [rip+0]; addr。fail_reason 为空时只回 true/false。
 //follow_thunks=false（默认）：补丁就打在 target 这个地址上 —— 虚表槽指哪就打哪，
 //  这样“通过槽位调用”一定走进我们的钩子（实测打过一次“顺着 jmp 打到真身”，
 //  结果自检时调用槽位根本没进钩子，说明那个 jmp 的目标并不是调用真正去的地方）。
@@ -62,3 +69,11 @@ void RemoveInlineDetour(InlineDetour& detour);
 
 //已经装上了吗
 inline bool DetourInstalled(const InlineDetour& detour) { return detour.installed; }
+
+//真正被改写的那 14 字节的起始地址（入口有着陆垫时它在入口后面 3 字节）
+inline void* DetourPatchAddress(const InlineDetour& detour)
+{
+    if (detour.target == nullptr)
+        return nullptr;
+    return static_cast<unsigned char*>(detour.target) + detour.patch_offset;
+}

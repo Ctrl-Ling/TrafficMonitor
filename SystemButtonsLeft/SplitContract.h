@@ -25,9 +25,9 @@ static constexpr const wchar_t* kRegPid = L"TaskbarSplitPid";           //REG_DW
 static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的宽度，单位 1/100 DIP
 static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ 调试信息：助手在任务栏上看到的控件类型名
 static constexpr const wchar_t* kRegStep = L"TaskbarSplitStep";         //REG_DWORD 助手走到哪一步了（见下面的 kStep*），插件选项对话框直接显示这句话
-static constexpr const wchar_t* kRegPrologue = L"TaskbarSplitPrologue"; //REG_SZ 挂钩点函数开头 24 字节的十六进制，出错时靠它还原现场（reg query 就能看到）
-static constexpr const wchar_t* kRegTarget = L"TaskbarSplitTarget";     //REG_SZ S:=虚表槽里的地址 T:=真正下补丁的地址，两者不一致就说明调用没走我们改的地方
-static constexpr const wchar_t* kRegSelfTest = L"TaskbarSplitSelfTest"; //REG_SZ 自检现场：哪一步失败、调用计数加了几、返回码是多少
+static constexpr const wchar_t* kRegPrologue = L"TaskbarSplitPrologue"; //REG_SZ 挂钩现场字节：S:=虚表槽地址（函数入口）开头24字节 A:=真正下补丁地址开头24字节（reg query 就能看到）
+static constexpr const wchar_t* kRegTarget = L"TaskbarSplitTarget";     //REG_SZ S:=槽地址 T:=函数入口 A:=补丁地址（T+3 说明入口是 endbr64 没被盖）M:=模块基址，S-M 就是该函数的 RVA
+static constexpr const wchar_t* kRegSelfTest = L"TaskbarSplitSelfTest"; //REG_SZ 自检现场：哪一步失败、计数加了几、HRESULT、以及 SEH 异常码（0xC000061B=CET 控制保护异常）
 
 // 助手的进度码：挂钩这件事跨了两个进程，出错时只看“没生效”没法定位，
 // 所以每过一个里程碑就写一个数，插件把数字翻译成中文显示出来。

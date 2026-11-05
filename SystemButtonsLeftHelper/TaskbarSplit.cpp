@@ -510,30 +510,36 @@ static bool IsInXamlModule(void* address)
     return name.find(L"xaml") != std::wstring::npos;
 }
 
-//调用一个可能随时崩的函数：只用裸指针，出异常就返回 false
-static bool SafeCall(Arrange_func func, void* abi, Rect rect, HRESULT* hr)
+//调用一个可能随时崩的函数：只用裸指针，出异常就返回 false，并把异常码带出来。
+//异常码才是真证据：0xC000061B=控制保护异常（CET：入口的 endbr64 被盖掉了，间接调用被 CPU 拦下）；
+//0xC0000005=普通访问违例（搬走的指令跑飞了 / 参数不对）；0xC0000617=CFG 违规。
+//这三种的下一步做法完全不一样，只报“崩了”等于没报。
+static bool SafeCall(Arrange_func func, void* abi, Rect rect, HRESULT* hr, DWORD* se_code)
 {
     __try
     {
         *hr = func(abi, rect);
         return true;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except ((*se_code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER))
     {
         return false;
     }
 }
 
-//自检现场写进注册表（TaskbarSplitSelfTest）：哪一步、计数加了几、返回码。
-//“没进钩子”和“进了钩子但跑飞了”看着都是“没生效”，做法却完全相反，只能靠这两个数字分。
-static void PublishSelfTest(const wchar_t* stage, long call_delta, HRESULT hr)
+//自检现场写进注册表（TaskbarSplitSelfTest）：哪一步、计数加了几、返回码、异常码。
+//“没进钩子”和“进了钩子但跑飞了”看着都是“没生效”，做法却完全相反，只能靠这几个数字分。
+static void PublishSelfTest(const wchar_t* stage, long call_delta, HRESULT hr, DWORD se_code)
 {
-    wchar_t text[128]{};
-    ::swprintf_s(text, L"%s calls=%ld hr=0x%08lX", stage, call_delta, static_cast<unsigned long>(hr));
+    wchar_t text[160]{};
+    ::swprintf_s(text, L"%s calls=%ld hr=0x%08lX se=0x%08lX", stage, call_delta,
+        static_cast<unsigned long>(hr), static_cast<unsigned long>(se_code));
     SplitRegWriteStringIfChanged(kRegSelfTest, text);
 }
 
-//槽地址和实际下补丁的地址一起写出来：两者不一致，就说明调用根本不走我们改的地方。
+//槽地址、函数入口、真正下补丁的地址一起写出来：
+//入口和补丁地址差 3 字节 = 入口是 endbr64 着陆垫，我们没盖它（CET 要求，盖了必崩）；
+//入口和槽地址不一致 = 穿过了开头的 jmp，那调用可能根本不走我们改的地方。
 //M:=槽地址所在模块的加载基址 —— S 减 M 就是这个函数在这个 dll 里的偏移，
 //拿这个偏移去查微软公开符号（dbghelp SymFromAddr）就能直接问出“槽位 92 到底叫什么名字”。
 static void PublishTargetAddresses(void* slot_address, const InlineDetour& detour)
@@ -543,10 +549,11 @@ static void PublishTargetAddresses(void* slot_address, const InlineDetour& detou
     if (::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
         reinterpret_cast<LPCWSTR>(slot_address), &module) && module != nullptr)
         module_base = reinterpret_cast<uintptr_t>(module);
-    wchar_t text[160]{};
-    ::swprintf_s(text, L"S:0x%016llX T:0x%016llX M:0x%016llX",
+    wchar_t text[200]{};
+    ::swprintf_s(text, L"S:0x%016llX T:0x%016llX A:0x%016llX M:0x%016llX",
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(slot_address)),
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(detour.target)),
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(DetourPatchAddress(detour))),
         static_cast<unsigned long long>(module_base));
     SplitRegWriteStringIfChanged(kRegTarget, text);
 }
@@ -566,33 +573,35 @@ static int ValidateHook()
 
         const long before = g_arrange_call_count.load();
         HRESULT hr{};
+        DWORD se_code{};
         //这一脚踩下去要么进我们的函数（计数 +1），要么直接崩；两种都算“没确认成功”，但原因要分开报
-        if (!SafeCall(slot, abi, Rect{ 0.0f, 0.0f, 40.0f, 40.0f }, &hr))
+        if (!SafeCall(slot, abi, Rect{ 0.0f, 0.0f, 40.0f, 40.0f }, &hr, &se_code))
         {
-            PublishSelfTest(L"crash", g_arrange_call_count.load() - before, hr);
+            PublishSelfTest(L"crash", g_arrange_call_count.load() - before, hr, se_code);
             return static_cast<int>(kStepSelfCallCrashed);
         }
         const long delta = g_arrange_call_count.load() - before;
         if (delta == 0)
         {
             //正常返回了却一次都没进我们的函数 = 补丁不在这条调用路径上
-            PublishSelfTest(L"nohook", delta, hr);
+            PublishSelfTest(L"nohook", delta, hr, se_code);
             return static_cast<int>(kStepSelfCallNotHooked);
         }
 
         //再直接走一遍 trampoline，确保搬走的指令是好的
-        if (!SafeCall(g_arrange_original, abi, Rect{ 0.0f, 0.0f, 42.0f, 42.0f }, &hr))
+        se_code = 0;
+        if (!SafeCall(g_arrange_original, abi, Rect{ 0.0f, 0.0f, 42.0f, 42.0f }, &hr, &se_code))
         {
-            PublishSelfTest(L"tramp", g_arrange_call_count.load() - before, hr);
+            PublishSelfTest(L"tramp", g_arrange_call_count.load() - before, hr, se_code);
             return static_cast<int>(kStepTrampolineFailed);
         }
-        PublishSelfTest(L"ok", g_arrange_call_count.load() - before, hr);
+        PublishSelfTest(L"ok", g_arrange_call_count.load() - before, hr, se_code);
         return 0;
     }
     catch (...)
     {
         //建探针对象/取虚表就抛了，这个线程里的 XAML 运行时状态有问题
-        PublishSelfTest(L"cpp", 0, static_cast<HRESULT>(E_UNEXPECTED));
+        PublishSelfTest(L"cpp", 0, static_cast<HRESULT>(E_UNEXPECTED), 0);
         return static_cast<int>(kStepSelfCallThrew);
     }
 }
@@ -621,22 +630,23 @@ static void BytesToHex(void* address, wchar_t* out)
 }
 
 //把挂钩现场写进注册表（TaskbarSplitPrologue）：
-//S: = 虚表槽里那个地址的开头字节；T: = 真正下补丁的地址（穿过了开头的 jmp 时两者才不同）。
-//装成功时 T: 会是 FF2500000000+地址，正好证明补丁还在；装失败时它就是卡住的那段原始指令。
+//S: = 虚表槽里那个地址（函数入口）的开头 24 字节；A: = 真正下补丁那个地址的开头 24 字节。
+//入口若以 0F1EFA 开头就是 endbr64 着陆垫，补丁必须从它后面第 3 字节开始（A: 比 S: 晚 3 字节）；
+//装成功时 A: 会是 FF2500000000+钩子地址，正好证明补丁还在；装失败时这两串就是卡住的原始指令。
 static void PublishPrologue(void* slot_address, const InlineDetour& detour)
 {
-    wchar_t slot_hex[64]{}, target_hex[64]{};
+    wchar_t slot_hex[64]{}, patch_hex[64]{};
     BytesToHex(slot_address, slot_hex);
     wchar_t text[160]{};
     size_t pos = 0;
     auto append = [&](const wchar_t* s) { while (*s != L'\0') text[pos++] = *s++; };
     append(L"S:");
     append(slot_hex);
-    if (detour.target != nullptr && detour.target != slot_address)
+    if (detour.target != nullptr)
     {
-        BytesToHex(detour.target, target_hex);
-        append(L" T:");
-        append(target_hex);
+        BytesToHex(DetourPatchAddress(detour), patch_hex);
+        append(L" A:");
+        append(patch_hex);
     }
     text[pos] = L'\0';
     SplitRegWriteStringIfChanged(kRegPrologue, text);
