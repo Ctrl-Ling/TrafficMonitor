@@ -494,9 +494,13 @@ bool InstallInlineDetour(InlineDetour& detour, void* target, void* hook, DetourF
         {
             fail = kDetourFailUnreadable;
         }
-        else if (!BuildPrologue(code_bytes, plan) || plan.total_length > sizeof(detour.saved_bytes))
+        else if (!BuildPrologue(code_bytes, plan))
         {
             fail = kDetourFailBadInstruction;
+        }
+        else if (plan.total_length > sizeof(detour.saved_bytes))
+        {
+            fail = kDetourFailTooLong;
         }
         else
         {
