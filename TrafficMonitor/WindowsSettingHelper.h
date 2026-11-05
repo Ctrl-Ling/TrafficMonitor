@@ -11,6 +11,7 @@ public:
     static bool IsTaskbarWidgetsBtnShown();             //任务栏是否显示了“小组件”按钮
     static bool IsTaskbarCenterAlign();                  //任务栏是否居中
 
+    static bool SetTaskbarCenterAlign(bool center_align); //set Win11 taskbar icon alignment (true=center, false=left) and notify explorer
 private:
     static LONG GetDWORDRegKeyData(HKEY hKey, const wstring& strValueName, DWORD& dwValueData);
     static bool GetDWORDRegKeyData(HKEY keyParent, const wstring& strKeyName, const wstring& strValueName, DWORD& dwValueData);

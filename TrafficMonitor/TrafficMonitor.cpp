@@ -217,6 +217,8 @@ void CTrafficMonitorApp::LoadConfig()
     m_taskbar_data.tbar_wnd_on_left = ini.GetBool(_T("task_bar"), _T("task_bar_wnd_on_left"), false);
     m_taskbar_data.speed_short_mode = ini.GetBool(_T("task_bar"), _T("task_bar_speed_short_mode"), true);
     m_taskbar_data.tbar_wnd_snap = ini.GetBool(_T("task_bar"), _T("task_bar_wnd_snap"), false);
+    m_taskbar_data.win_btn_left_icon_center = ini.GetBool(_T("task_bar"), _T("win_btn_left_icon_center"), false);
+    m_taskbar_data.win_btn_left_prev_alignment = ini.GetInt(_T("task_bar"), _T("win_btn_left_prev_alignment"), 1);
     m_taskbar_data.unit_byte = ini.GetBool(_T("task_bar"), _T("unit_byte"), true);
     m_taskbar_data.speed_unit = static_cast<SpeedUnit>(ini.GetInt(_T("task_bar"), _T("task_bar_speed_unit"), 0));
     m_taskbar_data.hide_unit = ini.GetBool(_T("task_bar"), _T("task_bar_hide_unit"), false);
@@ -383,6 +385,8 @@ void CTrafficMonitorApp::SaveConfig()
 
     ini.WriteBool(L"task_bar", L"task_bar_wnd_on_left", m_taskbar_data.tbar_wnd_on_left);
     ini.WriteBool(L"task_bar", L"task_bar_wnd_snap", m_taskbar_data.tbar_wnd_snap);
+    ini.WriteBool(L"task_bar", L"win_btn_left_icon_center", m_taskbar_data.win_btn_left_icon_center);
+    ini.WriteInt(L"task_bar", L"win_btn_left_prev_alignment", m_taskbar_data.win_btn_left_prev_alignment);
     ini.WriteBool(L"task_bar", L"task_bar_speed_short_mode", m_taskbar_data.speed_short_mode);
     ini.WriteBool(L"task_bar", L"unit_byte", m_taskbar_data.unit_byte);
     ini.WriteInt(L"task_bar", L"task_bar_speed_unit", static_cast<int>(m_taskbar_data.speed_unit));

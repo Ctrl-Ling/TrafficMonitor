@@ -115,6 +115,7 @@ void CTaskBarSettingsDlg::EnableControl()
     EnableDlgCtrl(IDC_TASKBAR_WND_ON_LEFT_CHECK, !theApp.IsWindows11Taskbar() || CWindowsSettingHelper::IsTaskbarCenterAlign());
     EnableDlgCtrl(IDC_ENABLE_COLOR_EMOJI_CHECK, !m_data.disable_d2d);
     EnableDlgCtrl(IDC_WIN11_SETTINGS_BUTTON, theApp.IsWindows11Taskbar());
+    EnableDlgCtrl(IDC_WIN_BTN_LEFT_ICON_CENTER_CHECK, theApp.IsWindows11Taskbar());
 }
 
 
@@ -268,6 +269,7 @@ BEGIN_MESSAGE_MAP(CTaskBarSettingsDlg, CTabDlg)
     ON_BN_CLICKED(IDC_ENABLE_COLOR_EMOJI_CHECK, &CTaskBarSettingsDlg::OnBnClickedEnableColorEmojiCheck)
     ON_CBN_SELCHANGE(IDC_DIGIT_NUMBER_COMBO, &CTaskBarSettingsDlg::OnCbnSelchangeDigitNumberCombo)
     ON_BN_CLICKED(IDC_WIN11_SETTINGS_BUTTON, &CTaskBarSettingsDlg::OnBnClickedWin11SettingsButton)
+    ON_BN_CLICKED(IDC_WIN_BTN_LEFT_ICON_CENTER_CHECK, &CTaskBarSettingsDlg::OnBnClickedWinBtnLeftIconCenterCheck)
     ON_BN_CLICKED(IDC_TASKBAR_WND_IN_SECONDARY_DISPLAY_CHECK, &CTaskBarSettingsDlg::OnBnClickedTaskbarWndInSecondaryDisplayCheck)
     ON_CBN_SELCHANGE(IDC_DISPLAY_TO_SHOW_TASKBAR_WND_COMBO, &CTaskBarSettingsDlg::OnCbnSelchangeDisplayToShowTaskbarWndCombo)
     ON_BN_CLICKED(IDC_USAGE_GRAPH_FOLLOW_SYSTEM_CHECK, &CTaskBarSettingsDlg::OnBnClickedUsageGraphFollowSystemCheck)
@@ -301,6 +303,7 @@ BOOL CTaskBarSettingsDlg::OnInitDialog()
 
     //((CButton*)GetDlgItem(IDC_SWITCH_UP_DOWN_CHECK1))->SetCheck(m_data.swap_up_down);
     ((CButton*)GetDlgItem(IDC_TASKBAR_WND_ON_LEFT_CHECK))->SetCheck(m_data.tbar_wnd_on_left);
+    CheckDlgButton(IDC_WIN_BTN_LEFT_ICON_CENTER_CHECK, m_data.win_btn_left_icon_center);
     ((CButton*)GetDlgItem(IDC_SPEED_SHORT_MODE_CHECK))->SetCheck(m_data.speed_short_mode);
     ((CButton*)GetDlgItem(IDC_VALUE_RIGHT_ALIGN_CHECK))->SetCheck(m_data.value_right_align);
     ((CButton*)GetDlgItem(IDC_HORIZONTAL_ARRANGE_CHECK))->SetCheck(m_data.horizontal_arrange);
@@ -502,6 +505,15 @@ void CTaskBarSettingsDlg::OnBnClickedTaskbarWndOnLeftCheck()
 {
     // TODO: 在此添加控件通知处理程序代码
     m_data.tbar_wnd_on_left = (((CButton*)GetDlgItem(IDC_TASKBAR_WND_ON_LEFT_CHECK))->GetCheck() != 0);
+    m_data.win_btn_left_icon_center = (IsDlgButtonChecked(IDC_WIN_BTN_LEFT_ICON_CENTER_CHECK) != 0);
+    EnableControl();
+}
+
+
+void CTaskBarSettingsDlg::OnBnClickedWinBtnLeftIconCenterCheck()
+{
+    //勾选状态在OnOK/应用时统一生效，这里只更新设置数据
+    m_data.win_btn_left_icon_center = (IsDlgButtonChecked(IDC_WIN_BTN_LEFT_ICON_CENTER_CHECK) != 0);
     EnableControl();
 }
 

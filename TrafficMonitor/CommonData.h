@@ -317,6 +317,8 @@ struct TaskBarSettingData : public PublicSettingData
     bool show_status_bar{ true };       //显示 CPU/内存的状态条
     bool tbar_wnd_on_left{ false };     //如果为true，则任务栏窗口显示在任务栏的左侧（或上方）
     bool tbar_wnd_snap{ false };     	//如果为true，则在Win11中任务栏窗口贴靠中间任务栏，否则靠近边缘
+    bool win_btn_left_icon_center{ false };    //如果为true，则在Win11中将开始/搜索/任务视图按钮显示在任务栏左侧（“win按钮居左，软件图标居中”）
+    int win_btn_left_prev_alignment{ 1 };      //启用“win按钮居左，软件图标居中”前Windows任务栏图标对齐方式的原始值（1:居中，0:靠左），取消勾选时用于恢复
     bool cm_graph_type{ false };        //如果为false，默认原样式，柱状图显示占用率，如为true，滚动显示占用率
     bool show_graph_dashed_box{ true }; //显示占用图虚线框
 

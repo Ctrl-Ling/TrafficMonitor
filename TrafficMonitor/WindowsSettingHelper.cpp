@@ -65,6 +65,22 @@ bool CWindowsSettingHelper::IsTaskbarCenterAlign()
     return data != 0;
 }
 
+bool CWindowsSettingHelper::SetTaskbarCenterAlign(bool center_align)
+{
+    CRegKey key;
+    if (key.Open(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", KEY_SET_VALUE) != ERROR_SUCCESS)
+        return false;
+    DWORD value = center_align ? 1 : 0;
+    if (key.SetDWORDValue(L"TaskbarAl", value) != ERROR_SUCCESS)
+        return false;
+    key.Close();
+    // 通知资源管理器立即应用任务栏对齐方式的更改
+    DWORD_PTR result{};
+    ::SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"TraySettings"),
+        SMTO_ABORTIFHUNG | SMTO_NOTIMEOUTIFNOTHUNG, 500, &result);
+    return true;
+}
+
 LONG CWindowsSettingHelper::GetDWORDRegKeyData(HKEY hKey, const wstring& strValueName, DWORD& dwValueData)
 {
     DWORD dwBufferSize(sizeof(DWORD));
