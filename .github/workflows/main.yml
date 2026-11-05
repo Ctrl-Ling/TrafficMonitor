@@ -2,6 +2,8 @@ name: Release CI
 on:
   push:
     tags: ['v*']
+    #推送 win-icon-left 分支时自动编译该分支（工作流文件取自被推送的分支本身）
+    branches: ['win-icon-left']
   workflow_dispatch:
 
 jobs:
