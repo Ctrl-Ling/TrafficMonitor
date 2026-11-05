@@ -54,6 +54,7 @@ Known limitations:
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.Xaml.Automation.h>
+#include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.Shapes.h>
 #include <winrt/Windows.UI.Xaml.h>
@@ -65,7 +66,7 @@ using namespace winrt::Windows::UI::Xaml;
 
 // Registry contract with TrafficMonitor (see WindowsSettingHelper.cpp):
 //   TaskbarSplitEnabled  DWORD written by TrafficMonitor, 1 = option enabled
-//   TaskbarSplitActive    DWORD written here, 1 while the buttons are pinned
+//   TaskbarSplitActive    DWORD written here, 1 while the module is ready in explorer
 //   TaskbarSplitPid       DWORD written here, explorer.exe pid
 //   TaskbarSplitBlock     DWORD written here, pinned block width in 1/100 DIP
 static constexpr PCWSTR kRegSubKey = L"Software\\TrafficMonitor";
@@ -79,6 +80,7 @@ std::atomic<bool> g_taskbarViewDllLoaded;
 HKEY g_regKey = nullptr;
 
 thread_local bool g_inArrangeOverride;
+thread_local bool g_passEnabled;
 thread_local double g_blockWidthDip;
 
 enum class SystemButton {
@@ -170,6 +172,26 @@ bool IsPinnedClusterButton(SystemButton button) {
 
 bool IsVerticalTaskbar(FrameworkElement const& taskbarFrame) {
     return taskbarFrame.ActualHeight() > taskbarFrame.ActualWidth();
+}
+
+FrameworkElement FindChildByName(FrameworkElement const& parent,
+                                 winrt::hstring const& name) {
+    int count = Media::VisualTreeHelper::GetChildrenCount(parent);
+    for (int i = 0; i < count; i++) {
+        auto child =
+            Media::VisualTreeHelper::GetChild(parent, i).try_as<FrameworkElement>();
+        if (!child) {
+            continue;
+        }
+        if (child.Name() == name) {
+            return child;
+        }
+        if (auto found = FindChildByName(child, name)) {
+            return found;
+        }
+    }
+
+    return nullptr;
 }
 
 // The extent a cluster button takes up when it is not collapsed. The element's
@@ -302,9 +324,9 @@ void UpdateWidgetsPosition(FrameworkElement const& element, bool enabled) {
 // Margin changes are deferred off the current layout pass: changing a margin
 // while arranging would re-enter layout.
 void PostToTaskbarThread(FrameworkElement const& element,
-                         void (*func)(FrameworkElement const&, bool)) {
+                         void (*func)(FrameworkElement const&, bool),
+                         bool enabled) {
     try {
-        bool enabled = IsSplitEnabled();
         element.Dispatcher().TryRunAsync(
             winrt::Windows::UI::Core::CoreDispatcherPriority::High,
             [element, func, enabled]() { func(element, enabled); });
@@ -369,7 +391,8 @@ HRESULT WINAPI IUIElement_Arrange_Hook(void* pThis,
     // Raw ABI boundary (a process-wide vtable slot): an exception escaping here
     // would fail-fast the whole explorer process.
     try {
-        bool enabled = IsSplitEnabled();
+        // Read once per layout pass (in ArrangeOverride), not once per element.
+        const bool enabled = g_passEnabled;
 
         FrameworkElement element = nullptr;
         static_cast<IUnknown*>(pThis)->QueryInterface(
@@ -382,7 +405,7 @@ HRESULT WINAPI IUIElement_Arrange_Hook(void* pThis,
 
         if (button == SystemButton::Widgets) {
             if (WidgetsPositionNeedsUpdate(element, enabled)) {
-                PostToTaskbarThread(element, UpdateWidgetsPosition);
+                PostToTaskbarThread(element, UpdateWidgetsPosition, enabled);
             }
             if (enabled) {
                 auto taskbarFrame =
@@ -407,7 +430,7 @@ HRESULT WINAPI IUIElement_Arrange_Hook(void* pThis,
         }
 
         if (ClusterMarginNeedsUpdate(element, enabled)) {
-            PostToTaskbarThread(element, UpdateClusterCollapse);
+            PostToTaskbarThread(element, UpdateClusterCollapse, enabled);
         }
 
         if (!enabled) {
@@ -441,6 +464,58 @@ HRESULT WINAPI IUIElement_Arrange_Hook(void* pThis,
     }
 }
 
+// When Explorer started with centered icons, the Start button's inner panel is
+// narrower than in the left-aligned layout, so a pinned Start icon hugs the
+// leading edge. Widen the panel to the left-aligned geometry.
+using ExperienceToggleButton_UpdateButtonPadding_t = void(WINAPI*)(void* pThis);
+ExperienceToggleButton_UpdateButtonPadding_t
+    ExperienceToggleButton_UpdateButtonPadding_Original;
+
+void WINAPI ExperienceToggleButton_UpdateButtonPadding_Hook(void* pThis) {
+    ExperienceToggleButton_UpdateButtonPadding_Original(pThis);
+
+    if (g_unloading) {
+        return;
+    }
+
+    try {
+        FrameworkElement element = nullptr;
+        static_cast<IUnknown*>(reinterpret_cast<void**>(pThis)[1])
+            ->QueryInterface(winrt::guid_of<FrameworkElement>(),
+                             winrt::put_abi(element));
+        if (!element) {
+            return;
+        }
+
+        if (winrt::get_class_name(element) != L"Taskbar.ExperienceToggleButton") {
+            return;
+        }
+        if (Automation::AutomationProperties::GetAutomationId(element) !=
+            L"StartButton") {
+            return;
+        }
+
+        auto panel = FindChildByName(element, L"ExperienceToggleButtonRootPanel")
+                         .try_as<Controls::Grid>();
+        if (!panel) {
+            return;
+        }
+
+        constexpr double kNarrowPanelWidth = 45;
+        constexpr double kWidePanelWidth = 55;
+        const Thickness kNarrowPadding{2, 4, 2, 4};
+        const Thickness kWidePadding{12, 4, 2, 4};
+
+        if (panel.Width() == kNarrowPanelWidth) {
+            panel.Width(kWidePanelWidth);
+        }
+        if (panel.Padding() == kNarrowPadding) {
+            panel.Padding(kWidePadding);
+        }
+    } catch (...) {
+    }
+}
+
 using TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_t =
     HRESULT(WINAPI*)(void* pThis,
                      void* context,
@@ -469,15 +544,19 @@ HRESULT WINAPI TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_Hook(
         return true;
     }();
 
-    bool enabled = IsSplitEnabled();
+    g_passEnabled = IsSplitEnabled();
 
     g_blockWidthDip = 0;
-    g_inArrangeOverride = enabled;
+    g_inArrangeOverride = true;
     HRESULT ret = TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_Original(
         pThis, context, size, resultSize);
     g_inArrangeOverride = false;
 
-    PublishState(enabled, g_blockWidthDip);
+    // "Active" means the module is loaded and ready for this explorer process,
+    // not that the buttons are pinned right now: TrafficMonitor has to be able
+    // to tell "module present" apart from "module missing" before it decides
+    // whether turning the option on can keep the alignment on "Center".
+    PublishState(true, g_blockWidthDip);
 
     return ret;
 }
@@ -489,6 +568,12 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
             {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::Taskbar::implementation::TaskbarCollapsibleLayout,struct winrt::Microsoft::UI::Xaml::Controls::IVirtualizingLayoutOverrides>::ArrangeOverride(void *,struct winrt::Windows::Foundation::Size,struct winrt::Windows::Foundation::Size *))"},
             &TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_Original,
             TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_Hook,
+        },
+        {
+            {LR"(protected: virtual void __cdecl winrt::Taskbar::implementation::ExperienceToggleButton::UpdateButtonPadding(void))"},
+            &ExperienceToggleButton_UpdateButtonPadding_Original,
+            ExperienceToggleButton_UpdateButtonPadding_Hook,
+            true,  // optional: only a cosmetic fix for the Start button
         },
     };
 
@@ -555,10 +640,10 @@ BOOL Wh_ModInit() {
                                        &LoadLibraryExW_Original);
     }
 
-    // Announce the state right away so TrafficMonitor knows whether to keep
-    // the taskbar alignment on "Center". The block width is filled in by the
-    // first layout pass.
-    PublishState(IsSplitEnabled(), 0);
+    // Announce the module as ready right away so TrafficMonitor keeps the
+    // taskbar alignment on "Center" instead of falling back to "Left". The
+    // block width is filled in by the first layout pass.
+    PublishState(true, 0);
 
     return TRUE;
 }
