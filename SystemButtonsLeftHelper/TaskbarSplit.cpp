@@ -74,6 +74,12 @@ static void UpdateWidgetsPosition(FrameworkElement const& element, bool enabled)
 static void PostToTaskbarThread(FrameworkElement const& element,
     void(*func)(FrameworkElement const&, bool), bool enabled);
 
+//windows.h 里有 max 宏，std::max 会被展开坏，这里自己做“负数就归零”
+static double NotNegative(double value)
+{
+    return value < 0.0 ? 0.0 : value;
+}
+
 static void RememberTouched(FrameworkElement const& element)
 {
     void* abi = winrt::get_abi(element);
@@ -268,8 +274,8 @@ static void UpdateClusterCollapse(FrameworkElement const& element, bool enabled)
         Thickness new_margin = margin;
 
         //只还原本模块加过的塌陷边距（两个方向都清掉，任务栏可能在上下/左右之间切换过）
-        new_margin.Right = std::max(new_margin.Right, 0.0);
-        new_margin.Bottom = std::max(new_margin.Bottom, 0.0);
+        new_margin.Right = NotNegative(new_margin.Right);
+        new_margin.Bottom = NotNegative(new_margin.Bottom);
 
         if (enabled)
         {
@@ -411,7 +417,7 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
     try
     {
         FrameworkElement element{ nullptr };
-        static_cast<IUnknown*>(p_this)->QueryInterface(winrt::guid_of<FrameworkElement>(), winrt::put_abi(element));
+        reinterpret_cast<::IUnknown*>(p_this)->QueryInterface(winrt::guid_of<FrameworkElement>(), winrt::put_abi(element));
         if (!element)
             return g_arrange_original(p_this, rect);
 

@@ -287,7 +287,7 @@ bool InstallInlineDetour(InlineDetour& detour, void* target, void* hook)
     cursor += overwritten;
 
     //跳回目标函数没有被覆盖的部分
-    intptr_t back = static_cast<intptr_t>(static_cast<unsigned char*>(target) + overwritten) -
+    intptr_t back = reinterpret_cast<intptr_t>(static_cast<unsigned char*>(target) + overwritten) -
         (static_cast<intptr_t>(reinterpret_cast<uintptr_t>(cursor)) + 5);
     if (back <= -0x70000000LL || back >= 0x70000000LL)
     {

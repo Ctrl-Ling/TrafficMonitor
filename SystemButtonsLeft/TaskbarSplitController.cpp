@@ -407,7 +407,7 @@ DWORD WINAPI CTaskbarSplitController::StateWatchThreadEntry(LPVOID param)
         HKEY key = SplitOpenRegKey(KEY_NOTIFY);
         if (key == nullptr)
             break;
-        if (::RegNotifyChangeKeyValue(key, TRUE, self->m_state_event, TRUE) != ERROR_SUCCESS)
+        if (::RegNotifyChangeKeyValue(key, TRUE, REG_NOTIFY_CHANGE_LAST_SET, self->m_state_event, TRUE) != ERROR_SUCCESS)
         {
             ::RegCloseKey(key);
             break;

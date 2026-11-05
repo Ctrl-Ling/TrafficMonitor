@@ -123,7 +123,7 @@ static DWORD WINAPI WatchRegistryThread(LPVOID param)
         HKEY key = SplitOpenRegKey(KEY_NOTIFY);
         if (key == nullptr)
             break;
-        if (::RegNotifyChangeKeyValue(key, TRUE, change_event, TRUE) != ERROR_SUCCESS)
+        if (::RegNotifyChangeKeyValue(key, TRUE, REG_NOTIFY_CHANGE_LAST_SET, change_event, TRUE) != ERROR_SUCCESS)
         {
             ::RegCloseKey(key);
             break;

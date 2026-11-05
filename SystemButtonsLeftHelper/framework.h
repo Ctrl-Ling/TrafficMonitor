@@ -5,6 +5,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+//Windows 头和 C++/WinRT 撞名的宏（winrt 的头里会报 C4002）
+#ifdef GetCurrentTime
+#undef GetCurrentTime
+#endif
+
 //C++/WinRT 的运行时入口（RoGetActivationFactory 等）由这几个库提供。
 //写在这里而不是各个 .cpp 里，保证只要包含 framework.h 就自动带上。
 #pragma comment(lib, "windowsapp")
