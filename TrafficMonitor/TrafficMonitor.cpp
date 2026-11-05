@@ -1032,6 +1032,10 @@ BOOL CTrafficMonitorApp::InitInstance()
     //从ini文件载入设置
     LoadConfig();
 
+    //如果启用了“win按钮居左，软件图标居中”，启动时确保Win11任务栏图标对齐方式仍为“靠左”（系统更新或手动改动后恢复）
+    if (m_taskbar_data.win_btn_left_icon_center && IsWindows11Taskbar() && CWindowsSettingHelper::IsTaskbarCenterAlign())
+        CWindowsSettingHelper::SetTaskbarCenterAlign(false);
+
     m_taskbar_default_style.LoadConfig();
 
     //SaveConfig();
