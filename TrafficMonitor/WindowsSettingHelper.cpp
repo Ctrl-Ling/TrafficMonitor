@@ -81,8 +81,8 @@ bool CWindowsSettingHelper::SetTaskbarCenterAlign(bool center_align)
     return true;
 }
 
-//任务栏拆分模块（TaskbarSplitMod）是否正在当前资源管理器中生效
-//模块把开始、搜索、多任务视图按钮固定在任务栏左侧，同时保持图标对齐方式为“居中”
+//“win按钮居左，软件图标居中”插件是否正在当前资源管理器中生效
+//插件注入的助手把开始、搜索、多任务视图按钮固定在任务栏左侧，同时保持图标对齐方式为“居中”
 bool CWindowsSettingHelper::IsTaskbarSplitActive()
 {
     DWORD active{};

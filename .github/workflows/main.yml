@@ -34,6 +34,8 @@ jobs:
         path: |
           Bin/x64/Release (lite)/TrafficMonitor.exe
           Bin/x64/Release (lite)/*.dll
+          Bin/x64/Release/plugins/*.dll
+          Bin/x64/Release (lite)/plugins/*.dll
 
     - name : Upload pdb files
       uses: actions/upload-artifact@v4
@@ -67,6 +69,8 @@ jobs:
         path: |
           Bin/Release (lite)/TrafficMonitor.exe
           Bin/Release (lite)/*.dll
+          Bin/Release/plugins/*.dll
+          Bin/Release (lite)/plugins/*.dll
       
     - name : Upload pdb files
       uses: actions/upload-artifact@v4
@@ -103,6 +107,8 @@ jobs:
         path: |
           Bin/ARM64EC/Release (lite)/TrafficMonitor.exe
           Bin/ARM64EC/Release (lite)/*.dll
+          Bin/ARM64EC/Release/plugins/*.dll
+          Bin/ARM64EC/Release (lite)/plugins/*.dll
 
     - name : Upload pdb files
       uses: actions/upload-artifact@v4

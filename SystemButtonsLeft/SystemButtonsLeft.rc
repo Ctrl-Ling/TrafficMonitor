@@ -1,0 +1,64 @@
+// SystemButtonsLeft.rc : 插件的资源脚本
+//
+#include "resource.h"
+
+#define APSTUDIO_READONLY_SYMBOLS
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 2 resource.
+//
+#include "winres.h"
+
+/////////////////////////////////////////////////////////////////////////////
+#undef APSTUDIO_READONLY_SYMBOLS
+
+/////////////////////////////////////////////////////////////////////////////
+// 中文(简体，中国) resources
+
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_CHS)
+LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
+#pragma code_page(936)
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog
+//
+
+IDD_OPTIONS_DIALOG DIALOGEX 0, 0, 260, 120
+STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "win按钮居左，软件图标居中"
+FONT 9, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    CONTROL         "系统按钮（开始/搜索/多任务视图）固定在左侧",IDC_SPLIT_ENABLE_CHECK,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,7,7,246,10
+    GROUPBOX        "当前状态",IDC_STATIC,7,20,246,66
+    LTEXT           "",IDC_STATUS_LINE1,14,30,232,8
+    LTEXT           "",IDC_STATUS_LINE2,14,39,232,8
+    LTEXT           "",IDC_STATUS_LINE3,14,48,232,8
+    LTEXT           "",IDC_STATUS_LINE4,14,57,232,8
+    LTEXT           "",IDC_STATUS_LINE5,14,66,232,8
+    LTEXT           "",IDC_STATUS_LINE6,14,75,232,8
+    LTEXT           "取消勾选并点“确定”，即可恢复Windows默认布局。",IDC_SPLIT_HINT_STATIC,7,89,246,8
+    DEFPUSHBUTTON   "确定",IDOK,149,101,50,14
+    PUSHBUTTON      "取消",IDCANCEL,203,101,50,14
+END
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// DESIGNINFO
+//
+
+#ifdef APSTUDIO_INVOKED
+GUIDELINES DESIGNINFO
+BEGIN
+    IDD_OPTIONS_DIALOG, DIALOG
+    BEGIN
+        LEFTMARGIN, 7
+        RIGHTMARGIN, 253
+        TOPMARGIN, 7
+        BOTTOMMARGIN, 113
+    END
+END
+#endif    // APSTUDIO_INVOKED
+
+#endif    // 中文(简体，中国) resources

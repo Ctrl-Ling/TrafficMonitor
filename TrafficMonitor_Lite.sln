@@ -7,6 +7,10 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TrafficMonitor", "TrafficMo
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PluginDemo", "PluginDemo\PluginDemo.vcxproj", "{D1CA3ECC-DC32-445A-B734-C4DB08D4BA34}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SystemButtonsLeft", "SystemButtonsLeft\SystemButtonsLeft.vcxproj", "{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SystemButtonsLeftHelper", "SystemButtonsLeftHelper\SystemButtonsLeftHelper.vcxproj", "{5C2E88A1-3D7B-4F26-9A14-6B0E2F8D4C73}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug (lite)|ARM64EC = Debug (lite)|ARM64EC
@@ -17,6 +21,26 @@ Global
 		Release (lite)|x86 = Release (lite)|x86
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}.Debug (lite)|x64.ActiveCfg = Debug|x64
+		{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}.Debug (lite)|x64.Build.0 = Debug|x64
+		{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}.Debug (lite)|x86.ActiveCfg = Debug|Win32
+		{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}.Debug (lite)|x86.Build.0 = Debug|Win32
+		{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}.Debug (lite)|ARM64EC.ActiveCfg = Debug|ARM64EC
+		{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}.Debug (lite)|ARM64EC.Build.0 = Debug|ARM64EC
+		{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}.Release (lite)|x64.ActiveCfg = Release|x64
+		{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}.Release (lite)|x64.Build.0 = Release|x64
+		{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}.Release (lite)|x86.ActiveCfg = Release|Win32
+		{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}.Release (lite)|x86.Build.0 = Release|Win32
+		{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}.Release (lite)|ARM64EC.ActiveCfg = Release|ARM64EC
+		{7F3D9C25-4B1E-4A6D-9C8F-2E5A7B1D0F34}.Release (lite)|ARM64EC.Build.0 = Release|ARM64EC
+		{5C2E88A1-3D7B-4F26-9A14-6B0E2F8D4C73}.Debug (lite)|x64.ActiveCfg = Debug|x64
+		{5C2E88A1-3D7B-4F26-9A14-6B0E2F8D4C73}.Debug (lite)|x64.Build.0 = Debug|x64
+		{5C2E88A1-3D7B-4F26-9A14-6B0E2F8D4C73}.Debug (lite)|x86.ActiveCfg = Debug|x64
+		{5C2E88A1-3D7B-4F26-9A14-6B0E2F8D4C73}.Debug (lite)|ARM64EC.ActiveCfg = Debug|x64
+		{5C2E88A1-3D7B-4F26-9A14-6B0E2F8D4C73}.Release (lite)|x64.ActiveCfg = Release|x64
+		{5C2E88A1-3D7B-4F26-9A14-6B0E2F8D4C73}.Release (lite)|x64.Build.0 = Release|x64
+		{5C2E88A1-3D7B-4F26-9A14-6B0E2F8D4C73}.Release (lite)|x86.ActiveCfg = Release|x64
+		{5C2E88A1-3D7B-4F26-9A14-6B0E2F8D4C73}.Release (lite)|ARM64EC.ActiveCfg = Release|x64
 		{09483BED-B1E9-4827-8120-A18302C84AA8}.Debug (lite)|ARM64EC.ActiveCfg = Debug (lite)|ARM64EC
 		{09483BED-B1E9-4827-8120-A18302C84AA8}.Debug (lite)|ARM64EC.Build.0 = Debug (lite)|ARM64EC
 		{09483BED-B1E9-4827-8120-A18302C84AA8}.Debug (lite)|x64.ActiveCfg = Debug (lite)|x64
