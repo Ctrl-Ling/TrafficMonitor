@@ -788,35 +788,11 @@ void CTrafficMonitorDlg::ApplySettings(COptionsDlg& optionsDlg)
         || theApp.m_taskbar_data.auto_set_background_color != optionsDlg.m_tab2_dlg.m_data.auto_set_background_color
         );
     bool is_skin_data_changed = (theApp.m_main_wnd_data.ToSkinSettingData() != optionsDlg.m_tab1_dlg.m_data.ToSkinSettingData());
-    //“win按钮居左，软件图标居中”选项是否发生了变化
-    bool win_btn_left_icon_center_changed = (theApp.m_taskbar_data.win_btn_left_icon_center != optionsDlg.m_tab2_dlg.m_data.win_btn_left_icon_center);
 
     theApp.m_main_wnd_data = optionsDlg.m_tab1_dlg.m_data;
     theApp.m_taskbar_data = optionsDlg.m_tab2_dlg.m_data;
     theApp.m_general_data = optionsDlg.m_tab3_dlg.m_data;
     theApp.SendSettingsToPlugin();
-
-    //Win11下“win按钮居左，软件图标居中”：参考Windows11“任务栏图标对齐”设置中的“靠左”/“居中”来移动开始、搜索、任务视图按钮
-    if (theApp.IsWindows11Taskbar())
-    {
-        //把选项状态告诉任务栏拆分模块（模块未安装时这个值不会被使用）
-        CWindowsSettingHelper::SetTaskbarSplitEnabled(theApp.m_taskbar_data.win_btn_left_icon_center);
-
-        if (win_btn_left_icon_center_changed)
-        {
-            if (theApp.m_taskbar_data.win_btn_left_icon_center)
-            {
-                //记录启用前的对齐方式，以便取消勾选时恢复
-                theApp.m_taskbar_data.win_btn_left_prev_alignment = CWindowsSettingHelper::IsTaskbarCenterAlign() ? 1 : 0;
-                //拆分模块生效时保持“居中”（其他图标居中），由模块把系统按钮移到左侧；否则退回“靠左”
-                CWindowsSettingHelper::SetTaskbarCenterAlign(CWindowsSettingHelper::IsTaskbarSplitActive());
-            }
-            else
-            {
-                CWindowsSettingHelper::SetTaskbarCenterAlign(theApp.m_taskbar_data.win_btn_left_prev_alignment != 0);
-            }
-        }
-    }
 
     CGeneralSettingsDlg::CheckTaskbarDisplayItem();
 

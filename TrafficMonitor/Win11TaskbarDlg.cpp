@@ -12,9 +12,8 @@ void CWin11TaskbarDlg::AdjustTaskbarWndPos(bool force_adjust)
     m_rect.right = m_rect.left + m_window_width;
     m_rect.bottom = m_rect.top + m_window_height;
 
-    //“win按钮居左，软件图标居中”生效时，任务栏左侧被拆分模块固定了开始、搜索、多任务视图等按钮，
-    //此时任务栏窗口应该紧跟在按钮块后面（位于居中的应用图标之前）
-    bool split_active = theApp.m_taskbar_data.win_btn_left_icon_center && CWindowsSettingHelper::IsTaskbarSplitActive();
+    //有外部拆分器（插件）把系统按钮钉在左侧时，任务栏窗口紧跟在按钮块后面（位于居中的应用图标之前）
+    bool split_active = CWindowsSettingHelper::IsTaskbarSplitActive();
     int split_block_width = split_active ? CWindowsSettingHelper::GetTaskbarSplitBlockWidth() : 0;
 
     if (force_adjust || m_rcNotify.Width() != m_last_notify_width || m_rcStart.left != m_last_start_pos || split_block_width != m_last_split_block_width)   //如果最小化窗口的宽度改变了，重新设置任务栏窗口的位置
@@ -54,7 +53,7 @@ void CWin11TaskbarDlg::AdjustTaskbarWndPos(bool force_adjust)
             //}
         }
         //任务栏窗口显示在左侧时
-        else if (split_active && split_block_width > 0)     //“win按钮居左，软件图标居中”生效：紧跟在左侧按钮块后面
+        else if (split_active && split_block_width > 0)     //拆分器生效：紧跟在左侧系统按钮块后面
         {
             m_rect.MoveToX(DPI(split_block_width + 2));
         }

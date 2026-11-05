@@ -111,15 +111,6 @@ int CWindowsSettingHelper::GetTaskbarSplitBlockWidth()
     return static_cast<int>(block / 100);
 }
 
-//把“win按钮居左，软件图标居中”选项的状态告诉任务栏拆分模块
-void CWindowsSettingHelper::SetTaskbarSplitEnabled(bool enabled)
-{
-    CRegKey key;
-    if (key.Create(HKEY_CURRENT_USER, L"Software\\TrafficMonitor") != ERROR_SUCCESS)
-        return;
-    key.SetDWORDValue(L"TaskbarSplitEnabled", enabled ? 1u : 0u);
-}
-
 LONG CWindowsSettingHelper::GetDWORDRegKeyData(HKEY hKey, const wstring& strValueName, DWORD& dwValueData)
 {
     DWORD dwBufferSize(sizeof(DWORD));
