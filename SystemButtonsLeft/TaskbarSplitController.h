@@ -17,6 +17,7 @@ struct SplitStatus
     bool helper_injected{ false };  //插件是否已经把钩子挂上
     bool split_active{ false };     //助手已经在 explorer 里挂钩成功
     int block_width{ 0 };           //被钉在左侧的系统按钮块宽度（DIP）
+    int helper_step{ 0 };           //助手走到哪一步了（kStep*），0 表示当前 explorer 里没有助手在跑
     bool taskbar_center_align{ true };   //Windows 自己的“任务栏图标对齐”当前值
 };
 

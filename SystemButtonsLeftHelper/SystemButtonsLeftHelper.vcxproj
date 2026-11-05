@@ -44,15 +44,17 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <!-- 只做 x64：这个助手要被注入 64 位的 explorer.exe，并且里面是按 x64 指令集搬指令的 -->
+  <!-- 输出到主程序同级目录，不能进 plugins：TM 的插件管理会把 plugins 下每个 dll
+       都当插件加载，去找 TMPluginGetInstance，报“函数获取失败 127” -->
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
     <IncludePath>$(ProjectDir)..\include;$(ProjectDir)..\SystemButtonsLeft;$(IncludePath)</IncludePath>
-    <OutDir>$(SolutionDir)Bin\$(Platform)\$(Configuration)\plugins\</OutDir>
+    <OutDir>$(SolutionDir)Bin\$(Platform)\$(Configuration)\</OutDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
     <IncludePath>$(ProjectDir)..\include;$(ProjectDir)..\SystemButtonsLeft;$(IncludePath)</IncludePath>
-    <OutDir>$(SolutionDir)Bin\$(Platform)\$(Configuration)\plugins\</OutDir>
+    <OutDir>$(SolutionDir)Bin\$(Platform)\$(Configuration)\</OutDir>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>

@@ -34,6 +34,7 @@ jobs:
         path: |
           Bin/x64/Release (lite)/TrafficMonitor.exe
           Bin/x64/Release (lite)/*.dll
+          Bin/x64/Release/*.dll
           Bin/x64/Release/plugins/*.dll
           Bin/x64/Release (lite)/plugins/*.dll
 

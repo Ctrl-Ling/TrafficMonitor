@@ -61,6 +61,7 @@ static void ReportWorkingOnce()
         return;
     SplitRegWriteDwordIfChanged(kRegActive, 1u);
     SplitRegWriteDwordIfChanged(kRegPid, ::GetCurrentProcessId());
+    SplitRegWriteDwordIfChanged(kRegStep, kStepPinning);
 }
 
 //被我们动过边距的按钮，禁用时要一个个还原回去（用弱引用，元素被回收就自动失效）
@@ -524,7 +525,8 @@ static bool SafeCall(Arrange_func func, void* abi, Rect rect, HRESULT* hr)
 
 //自检：通过“已经被改过的虚表槽”调用一次 Arrange，确认我们的函数真的被执行了，
 //并且原函数开头被搬走的指令在 trampoline 上还能正常跑完。
-static bool ValidateHook()
+//返回 0 = 通过；否则返回失败步骤码，由调用方写进注册表，插件那边直接显示成中文。
+static int ValidateHook()
 {
     try
     {
@@ -536,19 +538,20 @@ static bool ValidateHook()
 
         long before = g_arrange_call_count.load();
         HRESULT hr{};
+        //这一脚踩下去要么进我们的函数（计数 +1），要么直接崩；两种都算“没确认成功”
         if (!SafeCall(slot, abi, Rect{ 0.0f, 0.0f, 40.0f, 40.0f }, &hr))
-            return false;
+            return static_cast<int>(kStepSelfCallMissed);
         if (g_arrange_call_count.load() == before)
-            return false;       //没走进我们的函数，说明这个槽位不是（或者没生效）
+            return static_cast<int>(kStepSelfCallMissed);       //没走进我们的函数，说明这个槽位不是（或者没生效）
 
         //再直接走一遍 trampoline，确保搬走的指令是好的
         if (!SafeCall(g_arrange_original, abi, Rect{ 0.0f, 0.0f, 42.0f, 42.0f }, &hr))
-            return false;
-        return true;
+            return static_cast<int>(kStepTrampolineFailed);
+        return 0;
     }
     catch (...)
     {
-        return false;
+        return static_cast<int>(kStepSelfCallMissed);
     }
 }
 
@@ -557,38 +560,54 @@ bool InstallTaskbarSplit()
     if (g_hook_installed.load())
         return true;
 
+    g_unloading = false;        //上一轮 RemoveTaskbarSplit 置过真，这里必须清掉，否则钩子会一直“只转发不干活”
+    void* arrange_address{};
     try
     {
-        g_unloading = false;
+        //这一步最容易失败：这个线程里没有 XAML 运行时的话，建对象就抛异常
         xaml_shapes::Rectangle rectangle;
         UIElement ui_element{ rectangle };
         void** vtable = *reinterpret_cast<void***>(winrt::get_abi(ui_element));
-        void* arrange_address = vtable[kIUIElementArrangeSlot];
-        if (arrange_address == nullptr || !IsInXamlModule(arrange_address))
-            return false;
-
-        if (!InstallInlineDetour(g_detour, arrange_address, reinterpret_cast<void*>(&ArrangeHook)))
-            return false;
-        g_arrange_original = reinterpret_cast<Arrange_func>(g_detour.trampoline);
-        if (g_arrange_original == nullptr)
-        {
-            RestoreDetourBytes();
-            return false;
-        }
-
-        g_hook_installed = true;
-        if (!ValidateHook())
-        {
-            RestoreDetourBytes();
-            return false;
-        }
-        return true;
+        arrange_address = vtable[kIUIElementArrangeSlot];
     }
     catch (...)
     {
-        RestoreDetourBytes();
+        SplitRegWriteDwordIfChanged(kRegStep, kStepProbeObjectFailed);
         return false;
     }
+
+    if (arrange_address == nullptr || !IsInXamlModule(arrange_address))
+    {
+        SplitRegWriteDwordIfChanged(kRegStep, kStepSlotNotXaml);
+        return false;
+    }
+
+    if (!InstallInlineDetour(g_detour, arrange_address, reinterpret_cast<void*>(&ArrangeHook)))
+    {
+        SplitRegWriteDwordIfChanged(kRegStep, kStepDetourFailed);
+        return false;
+    }
+    g_arrange_original = reinterpret_cast<Arrange_func>(g_detour.trampoline);
+    if (g_arrange_original == nullptr)
+    {
+        RestoreDetourBytes();
+        SplitRegWriteDwordIfChanged(kRegStep, kStepDetourFailed);
+        return false;
+    }
+
+    g_hook_installed = true;
+    const int validate_result = ValidateHook();
+    if (validate_result != 0)
+    {
+        //自检没过必须把“已挂钩”这个状态收回：否则下次再装会以为已经装好直接返回，
+        //而且 explorer 里还留着指向我们代码的跳转。
+        RestoreDetourBytes();
+        g_hook_installed = false;
+        SplitRegWriteDwordIfChanged(kRegStep, static_cast<DWORD>(validate_result));
+        return false;
+    }
+    SplitRegWriteDwordIfChanged(kRegStep, kStepHookInstalled);
+    return true;
 }
 
 void RemoveTaskbarSplit()
@@ -599,6 +618,7 @@ void RemoveTaskbarSplit()
     g_seen_taskbar_button = false;
     g_block_width_dip = 0.0;
     g_last_published_dip = -1.0;
+    SplitRegWriteDwordIfChanged(kRegStep, kStepNone);
 }
 
 void RestoreDetourBytes()

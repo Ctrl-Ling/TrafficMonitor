@@ -11,6 +11,27 @@ static void SetStatusLine(HWND hDlg, int id, const wchar_t* text)
     ::SetDlgItemTextW(hDlg, id, text);
 }
 
+//助手写在注册表里的进度码 -> 一句话诊断。
+//挂钩是跨进程的（插件在 TrafficMonitor，助手在 explorer.exe），只看“没生效”没法定位，
+//所以助手每过一步就写一个码，这里翻译成人话。
+static const wchar_t* HelperStepText(int step)
+{
+    switch (step)
+    {
+    case kStepNone:               return L"当前 explorer 里没有助手在跑（没注入，或 explorer 刚重启过）";
+    case kStepHookRan:            return L"助手已进 explorer 的任务栏线程，还没读到开关";
+    case kStepRequestSeen:        return L"助手读到开关了，正在装挂钩";
+    case kStepProbeObjectFailed:  return L"建 XAML 探针对象失败（这个线程拿不到 XAML 运行时）";
+    case kStepSlotNotXaml:        return L"槽位地址不在 XAML 模块里（这个系统版本上槽位 92 不对）";
+    case kStepDetourFailed:       return L"内联跳转装不上（函数开头指令看不懂，或附近没有可执行内存）";
+    case kStepSelfCallMissed:     return L"自检失败：调用该槽位没进我们的函数（挂钩点不对）";
+    case kStepTrampolineFailed:   return L"自检失败：搬走的指令在 trampoline 上跑不动";
+    case kStepHookInstalled:      return L"挂钩成功，等任务栏排一次版就真正钉住";
+    case kStepPinning:            return L"正在钉住：系统按钮已经过挂钩";
+    default:                      return L"未知进度码";
+    }
+}
+
 //把控制器的当前状态填到对话框的“当前状态”分组里
 static void RefreshStatusLines(HWND hDlg)
 {
@@ -27,11 +48,11 @@ static void RefreshStatusLines(HWND hDlg)
     SetStatusLine(hDlg, IDC_STATUS_LINE2, buf);
 
     if (!st.helper_exists)
-        ::swprintf_s(buf, L"助手：未找到 %s（要和插件放在同一个 plugins 目录）", kHelperDllName);
+        ::swprintf_s(buf, L"助手：未找到 %s（要和 TrafficMonitor.exe 放同一个目录）", kHelperDllName);
     else if (st.split_active)
         ::swprintf_s(buf, L"助手：已在 explorer.exe 中挂钩，左侧按钮块宽 %d DIP", st.block_width);
     else if (st.helper_injected)
-        ::swprintf_s(buf, L"助手：已注入，但没能改写布局（保持系统默认）");
+        ::swprintf_s(buf, L"助手：已注入，但没能改写布局（未改动 Windows 的对齐设置）");
     else
         ::swprintf_s(buf, L"助手：已就位，尚未注入");
     SetStatusLine(hDlg, IDC_STATUS_LINE3, buf);
@@ -42,7 +63,9 @@ static void RefreshStatusLines(HWND hDlg)
 
     const wchar_t* result = CTaskbarSplitController::Instance().LastMessage().c_str();
     SetStatusLine(hDlg, IDC_STATUS_LINE5, result);
-    SetStatusLine(hDlg, IDC_STATUS_LINE6, L"");
+
+    ::swprintf_s(buf, L"诊断（%d）：%s", st.helper_step, HelperStepText(st.helper_step));
+    SetStatusLine(hDlg, IDC_STATUS_LINE6, buf);
 }
 
 static INT_PTR CALLBACK DlgProc(HWND hDlg, UINT message, WPARAM w_param, LPARAM l_param)

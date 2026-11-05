@@ -87,6 +87,9 @@ static void ProcessRequest()
 
         if (enabled != 0)
         {
+            //已经挂上了就别再写“准备装挂钩”，否则会把 30/40 这种更有用的码盖掉
+            if (!IsArrangeHookInstalled())
+                SplitRegWriteDwordIfChanged(kRegStep, kStepRequestSeen);
             InstallTaskbarSplit();
             SetSplitEnabled(true);
         }
@@ -97,10 +100,12 @@ static void ProcessRequest()
             RemoveTaskbarSplit();
         }
 
-        //刚装好时按钮还没经过挂钩，这里只能是 0；真正钉住后由挂钩自己补发 active=1
+        //只要助手还活着就报自己的进程号：插件会拿它和 Shell_TrayWnd 的进程号对一遍，
+        //explorer 重启后这个旧值自然失效。挂钩失败时也要写，否则“诊断”一行分不清
+        //“ explorer 里根本没有助手”和“有助手但卡在某一步”。
+        SplitRegWriteDwordIfChanged(kRegPid, ::GetCurrentProcessId());
         const bool working = IsTaskbarSplitWorking();
         SplitRegWriteDwordIfChanged(kRegActive, working ? 1u : 0u);
-        SplitRegWriteDwordIfChanged(kRegPid, working ? ::GetCurrentProcessId() : 0u);
         if (!working)
             SplitRegWriteDwordIfChanged(kRegBlock, 0u);
     }
@@ -152,8 +157,11 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK TaskbarSplitMessageHook(int co
     if (code == HC_ACTION)
     {
         g_taskbar_tid = ::GetCurrentThreadId();
-        if (!g_first_pass_done.exchange(true) || g_request_pending.exchange(false))
+        const bool first_pass = !g_first_pass_done.exchange(true);
+        if (first_pass || g_request_pending.exchange(false))
         {
+            if (first_pass)
+                SplitRegWriteDwordIfChanged(kRegStep, kStepHookRan);    //这一条写进去就证明 DLL 真的进了 explorer 的任务栏线程
             EnsureWatcherStarted();
             ProcessRequest();
         }

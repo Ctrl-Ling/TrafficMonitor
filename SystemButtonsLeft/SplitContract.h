@@ -24,8 +24,24 @@ static constexpr const wchar_t* kRegActive = L"TaskbarSplitActive";     //REG_DW
 static constexpr const wchar_t* kRegPid = L"TaskbarSplitPid";           //REG_DWORD 助手所在进程（explorer）的ID
 static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的宽度，单位 1/100 DIP
 static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ 调试信息：助手在任务栏上看到的控件类型名
+static constexpr const wchar_t* kRegStep = L"TaskbarSplitStep";         //REG_DWORD 助手走到哪一步了（见下面的 kStep*），插件选项对话框直接显示这句话
 
-// 助手 DLL 的文件名（与插件 DLL 放在同一个 plugins 目录下）
+// 助手的进度码：挂钩这件事跨了两个进程，出错时只看“没生效”没法定位，
+// 所以每过一个里程碑就写一个数，插件把数字翻译成中文显示出来。
+// 数字留出空隙，以后要在中间加一步不用重排。
+static constexpr DWORD kStepNone = 0;               //助手还没在当前 explorer 里跑过（或 explorer 已经重启）
+static constexpr DWORD kStepHookRan = 10;           //消息钩子进了 explorer 的任务栏线程
+static constexpr DWORD kStepRequestSeen = 20;       //读到开关=1，准备装挂钩
+static constexpr DWORD kStepProbeObjectFailed = 21; //建 XAML 探针对象失败（这个线程里拿不到 XAML 运行时）
+static constexpr DWORD kStepSlotNotXaml = 22;       //槽位里的地址不在 XAML 模块里（这个系统版本上槽位不对）
+static constexpr DWORD kStepDetourFailed = 23;      //内联跳转装不上（函数开头指令看不懂 / 附近没有可执行内存）
+static constexpr DWORD kStepSelfCallMissed = 24;    //自检失败：调用该槽位没进我们的函数
+static constexpr DWORD kStepTrampolineFailed = 25;  //自检失败：搬走的指令在 trampoline 上跑不动
+static constexpr DWORD kStepHookInstalled = 30;     //挂钩装好且自检通过
+static constexpr DWORD kStepPinning = 40;           //真的任务栏按钮经过了挂钩，正在钉住
+
+// 助手 DLL 的文件名。它不是 TM 插件，必须和 plugins 目录分开（否则 TM 的插件管理会去
+// 找它的 TMPluginGetInstance 并报“函数获取失败 127”），放在 TrafficMonitor.exe 同级目录。
 static constexpr const wchar_t* kHelperDllName = L"SystemButtonsLeftHelper.dll";
 // 助手 DLL 里供 SetWindowsHookEx 使用的钩子函数名
 static constexpr const char* kHelperHookProcName = "TaskbarSplitMessageHook";

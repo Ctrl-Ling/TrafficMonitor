@@ -96,19 +96,50 @@ void CTaskbarSplitController::SetConfigFile(const std::wstring& ini_path)
 
 std::wstring CTaskbarSplitController::GetHelperDllPath() const
 {
-    //g_plugin_module 是插件 DLL 自己的句柄（DllMain 里记下的），
-    //助手 DLL 就放在同一个 plugins 目录下。
-    if (g_plugin_module == nullptr)
-        return std::wstring();
-    wchar_t path[MAX_PATH]{};
-    if (::GetModuleFileNameW(g_plugin_module, path, MAX_PATH) == 0)
-        return std::wstring();
-    std::wstring dir(path);
-    size_t pos = dir.find_last_of(L'\\');
-    if (pos == std::wstring::npos)
-        return std::wstring();
-    dir = dir.substr(0, pos + 1);
-    return dir + kHelperDllName;
+    //助手 DLL 不是 TM 插件，不能和插件放在同一个 plugins 目录里：
+    //TM 的“插件管理”会把该目录下每个 dll 当插件加载，去找 TMPluginGetInstance，
+    //找不到就在列表里显示“函数获取失败，故障代码：127”。所以正式位置是 TrafficMonitor.exe 同级目录。
+    //老版本（放在 plugins 里）继续兼容，方便就地升级。
+    std::vector<std::wstring> dirs;
+
+    //1）主程序所在目录（正式位置）
+    wchar_t exe_path[MAX_PATH]{};
+    if (::GetModuleFileNameW(nullptr, exe_path, MAX_PATH) != 0)
+    {
+        std::wstring path(exe_path);
+        size_t pos = path.find_last_of(L'\\');
+        if (pos != std::wstring::npos)
+            dirs.push_back(path.substr(0, pos + 1));
+    }
+
+    //2）插件自己所在目录，以及它的上一级（老布局 / 绿色目录随便怎么摆）
+    if (g_plugin_module != nullptr)
+    {
+        wchar_t path[MAX_PATH]{};
+        if (::GetModuleFileNameW(g_plugin_module, path, MAX_PATH) != 0)
+        {
+            std::wstring full(path);
+            size_t pos = full.find_last_of(L'\\');
+            if (pos != std::wstring::npos)
+            {
+                std::wstring dir = full.substr(0, pos + 1);
+                dirs.push_back(dir);
+                std::wstring parent = dir.substr(0, dir.size() - 1);   //去掉结尾的 '\'
+                size_t up = parent.find_last_of(L'\\');
+                if (up != std::wstring::npos)
+                    dirs.push_back(parent.substr(0, up + 1));
+            }
+        }
+    }
+
+    for (const std::wstring& dir : dirs)
+    {
+        std::wstring candidate = dir + kHelperDllName;
+        if (::PathFileExistsW(candidate.c_str()))
+            return candidate;
+    }
+    //一个都没找到：返回主程序目录下的那个名字，让提示里说出的路径是“应该放的位置”
+    return dirs.empty() ? std::wstring(kHelperDllName) : dirs[0] + kHelperDllName;
 }
 
 void CTaskbarSplitController::LoadConfigAndApply()
@@ -151,7 +182,7 @@ bool CTaskbarSplitController::InjectHelper(std::wstring& msg)
     std::wstring dll_path = GetHelperDllPath();
     if (dll_path.empty() || !::PathFileExistsW(dll_path.c_str()))
     {
-        msg = L"找不到 " + std::wstring(kHelperDllName) + L"，把它和插件 DLL 一起放在 plugins 目录下。";
+        msg = L"找不到 " + std::wstring(kHelperDllName) + L"，把它放在 TrafficMonitor.exe 同一个目录（不要放进 plugins，否则会被当成插件加载并报错）。";
         return false;
     }
 
@@ -263,9 +294,23 @@ void CTaskbarSplitController::SwitchTaskbarAlignment(bool enable)
         return;
     if (enable)
     {
-        //助手挂钩成功 -> Windows 保持“居中”，由助手把系统按钮搬到左边，其他图标仍然居中；
-        //助手没成功 -> 退回 Windows 自带的“靠左”，至少系统按钮在左边。
-        WriteTaskbarAl(m_status.split_active);
+        if (m_status.split_active)
+        {
+            //助手真的在钉 -> Windows 保持“居中”，系统按钮由助手搬到左边，其他图标仍然居中
+            WriteTaskbarAl(true);
+        }
+        else if (m_status.helper_injected)
+        {
+            //助手已经注入进 explorer，只是还没证明自己能钉住（槽位不对、还没排版过一次等）。
+            //这时候绝不能改成“靠左”：那会让所有应用图标跟着一起靠左，用户看到的是“越开越坏”。
+            //保持 Windows 现在的样子，等 OnHelperStateChanged 收到 active=1 再切“居中”。
+            WriteTaskbarAl(m_prev_alignment != 0);
+        }
+        else
+        {
+            //助手根本装不上（dll 缺失、位数不对、钩子失败）-> 退回 Windows 自带的“靠左”
+            WriteTaskbarAl(false);
+        }
     }
     else
     {
@@ -328,7 +373,8 @@ bool CTaskbarSplitController::Apply(bool enable, std::wstring& msg)
     }
     if (enable && !m_status.split_active)
     {
-        m_last_msg = L"助手已注入，等任务栏排一次版才真正钉住；若长时间没生效说明挂钩点不对，会自动退回“靠左”。";
+        m_last_msg = L"助手已注入，等任务栏排一次版才真正钉住；这期间不动 Windows 的对齐设置。"
+            L"下面“诊断”一行会说明助手卡在哪一步。";
         msg = m_last_msg;
         return true;
     }
@@ -357,6 +403,9 @@ void CTaskbarSplitController::RefreshStatus()
     //助手上报的进程必须就是当前任务栏所在进程，否则 explorer 已经重启过、状态是旧的
     m_status.split_active = (active != 0 && helper_pid != 0 && tray_pid != 0 && helper_pid == tray_pid);
     m_status.block_width = m_status.split_active ? static_cast<int>(SplitRegReadDword(kRegBlock, 0) / 100) : 0;
+    //诊断码只有“当前这个 explorer 里的助手”写过的才算数：进程号对不上就是 explorer 重启后留下的旧值
+    m_status.helper_step = (helper_pid != 0 && helper_pid == tray_pid)
+        ? static_cast<int>(SplitRegReadDword(kRegStep, 0)) : 0;
 
     DWORD al = ReadTaskbarAl();
     m_status.taskbar_center_align = (al != 0);
@@ -428,7 +477,9 @@ void CTaskbarSplitController::OnHelperStateChanged()
     RefreshStatus();
     if (!m_enabled)
         return;
-    //另一个线程只读写这几个 POD 字段，最坏结果是晚一拍再对齐，下一次通知会自己纠正
-    if (m_status.taskbar_center_align != m_status.split_active)
-        WriteTaskbarAl(m_status.split_active);
+    //助手证明自己钉住了 -> 把 Windows 切到“居中”（这是拆分布局的前提）。
+    //反过来什么都不做：助手掉线或自检没过时绝不能改成“靠左”，那会让所有应用图标一起靠左，
+    //比保持原样更糟；这种情况只在“诊断”一行里说清楚卡在哪。
+    if (m_status.split_active && !m_status.taskbar_center_align)
+        WriteTaskbarAl(true);
 }
