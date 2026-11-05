@@ -18,6 +18,7 @@ private:
     CRect m_rcStart;     //开始按钮的矩形区域
     int m_last_notify_width{};
     int m_last_start_pos{};
+    int m_last_split_block_width{};     //上次“win按钮居左，软件图标居中”左侧按钮块的宽度（DIP，0表示拆分未生效）
 
     // 通过 CTaskBarDlg 继承
     void CheckTaskbarOnTopOrBottom() override;

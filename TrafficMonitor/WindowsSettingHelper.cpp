@@ -81,6 +81,45 @@ bool CWindowsSettingHelper::SetTaskbarCenterAlign(bool center_align)
     return true;
 }
 
+//任务栏拆分模块（TaskbarSplitMod）是否正在当前资源管理器中生效
+//模块把开始、搜索、多任务视图按钮固定在任务栏左侧，同时保持图标对齐方式为“居中”
+bool CWindowsSettingHelper::IsTaskbarSplitActive()
+{
+    DWORD active{};
+    if (!GetDWORDRegKeyData(HKEY_CURRENT_USER, L"Software\\TrafficMonitor", L"TaskbarSplitActive", active) || active == 0)
+        return false;
+
+    //模块运行在资源管理器进程中，资源管理器重启后旧的进程ID就会失效
+    DWORD pid{};
+    if (!GetDWORDRegKeyData(HKEY_CURRENT_USER, L"Software\\TrafficMonitor", L"TaskbarSplitPid", pid) || pid == 0)
+        return false;
+    HWND h_taskbar = ::FindWindow(L"Shell_TrayWnd", nullptr);
+    if (h_taskbar == nullptr)
+        return false;
+    DWORD taskbar_pid{};
+    ::GetWindowThreadProcessId(h_taskbar, &taskbar_pid);
+    return taskbar_pid != 0 && taskbar_pid == pid;
+}
+
+//模块固定在左侧的按钮块宽度（DIP），还没有拿到值时返回0
+int CWindowsSettingHelper::GetTaskbarSplitBlockWidth()
+{
+    DWORD block{};
+    if (!GetDWORDRegKeyData(HKEY_CURRENT_USER, L"Software\\TrafficMonitor", L"TaskbarSplitBlock", block))
+        return 0;
+    //模块以 1/100 DIP 为单位上报
+    return static_cast<int>(block / 100);
+}
+
+//把“win按钮居左，软件图标居中”选项的状态告诉任务栏拆分模块
+void CWindowsSettingHelper::SetTaskbarSplitEnabled(bool enabled)
+{
+    CRegKey key;
+    if (key.Create(HKEY_CURRENT_USER, L"Software\\TrafficMonitor") != ERROR_SUCCESS)
+        return;
+    key.SetDWORDValue(L"TaskbarSplitEnabled", enabled ? 1u : 0u);
+}
+
 LONG CWindowsSettingHelper::GetDWORDRegKeyData(HKEY hKey, const wstring& strValueName, DWORD& dwValueData)
 {
     DWORD dwBufferSize(sizeof(DWORD));

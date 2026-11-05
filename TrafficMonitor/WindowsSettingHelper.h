@@ -12,6 +12,9 @@ public:
     static bool IsTaskbarCenterAlign();                  //任务栏是否居中
 
     static bool SetTaskbarCenterAlign(bool center_align); //set Win11 taskbar icon alignment (true=center, false=left) and notify explorer
+    static bool IsTaskbarSplitActive();                  //TaskbarSplitMod is loaded and running in the current explorer.exe
+    static int GetTaskbarSplitBlockWidth();              //width in DIP of the Start/Search/TaskView(/Widgets) block pinned on the left
+    static void SetTaskbarSplitEnabled(bool enabled);    //publish the option state to TaskbarSplitMod (HKCU\Software\TrafficMonitor)
 private:
     static LONG GetDWORDRegKeyData(HKEY hKey, const wstring& strValueName, DWORD& dwValueData);
     static bool GetDWORDRegKeyData(HKEY keyParent, const wstring& strKeyName, const wstring& strValueName, DWORD& dwValueData);

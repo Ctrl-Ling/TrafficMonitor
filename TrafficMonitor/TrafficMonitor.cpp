@@ -1032,9 +1032,19 @@ BOOL CTrafficMonitorApp::InitInstance()
     //从ini文件载入设置
     LoadConfig();
 
-    //如果启用了“win按钮居左，软件图标居中”，启动时确保Win11任务栏图标对齐方式仍为“靠左”（系统更新或手动改动后恢复）
-    if (m_taskbar_data.win_btn_left_icon_center && IsWindows11Taskbar() && CWindowsSettingHelper::IsTaskbarCenterAlign())
-        CWindowsSettingHelper::SetTaskbarCenterAlign(false);
+    //把“win按钮居左，软件图标居中”选项的状态告诉任务栏拆分模块，并在启动时把系统设置纠正回来（系统更新或手动改动后恢复）
+    //- 拆分模块生效时保持“居中”：由模块把开始/搜索/多任务视图按钮移到左侧，其他图标仍然居中；
+    //- 模块未生效时退回Windows自带的“靠左”，此时所有图标都会靠左。
+    if (IsWindows11Taskbar())
+    {
+        CWindowsSettingHelper::SetTaskbarSplitEnabled(m_taskbar_data.win_btn_left_icon_center);
+        if (m_taskbar_data.win_btn_left_icon_center)
+        {
+            bool target_center_align = CWindowsSettingHelper::IsTaskbarSplitActive();
+            if (CWindowsSettingHelper::IsTaskbarCenterAlign() != target_center_align)
+                CWindowsSettingHelper::SetTaskbarCenterAlign(target_center_align);
+        }
+    }
 
     m_taskbar_default_style.LoadConfig();
 
