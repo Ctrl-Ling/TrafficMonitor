@@ -797,7 +797,7 @@ void CTrafficMonitorDlg::ApplySettings(COptionsDlg& optionsDlg)
     theApp.SendSettingsToPlugin();
 
     //Win11下“win按钮居左，软件图标居中”：参考Windows11“任务栏图标对齐”设置中的“靠左”/“居中”来移动开始、搜索、任务视图按钮
-    if (win_btn_left_icon_center_changed)
+    if (win_btn_left_icon_center_changed && theApp.IsWindows11Taskbar())
     {
         if (theApp.m_taskbar_data.win_btn_left_icon_center)
         {
