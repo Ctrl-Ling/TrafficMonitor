@@ -1,4 +1,7 @@
-﻿#include "framework.h"
+﻿// Author: Ctrl-Ling
+// Last Modified By: Ctrl-Ling
+// Last Modified At: 2026-11-06 14:34:41 +08:00
+#include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
 #include "SplitContract.h"
@@ -527,13 +530,22 @@ static bool SafeCall(Arrange_func func, void* abi, Rect rect, HRESULT* hr, DWORD
     }
 }
 
-//自检现场写进注册表（TaskbarSplitSelfTest）：哪一步、计数加了几、返回码、异常码。
+//自检现场写进注册表（TaskbarSplitSelfTest）：哪一步、计数加了几、返回码、异常码，后面还能再挂一串地址。
 //“没进钩子”和“进了钩子但跑飞了”看着都是“没生效”，做法却完全相反，只能靠这几个数字分。
-static void PublishSelfTest(const wchar_t* stage, long call_delta, HRESULT hr, DWORD se_code)
+static void PublishSelfTest(const wchar_t* stage, long call_delta, HRESULT hr, DWORD se_code,
+    const wchar_t* extra = nullptr)
 {
-    wchar_t text[160]{};
-    ::swprintf_s(text, L"%s calls=%ld hr=0x%08lX se=0x%08lX", stage, call_delta,
-        static_cast<unsigned long>(hr), static_cast<unsigned long>(se_code));
+    wchar_t text[400]{};
+    if (extra != nullptr && extra[0] != L'\0')
+    {
+        ::swprintf_s(text, L"%s calls=%ld hr=0x%08lX se=0x%08lX %s", stage, call_delta,
+            static_cast<unsigned long>(hr), static_cast<unsigned long>(se_code), extra);
+    }
+    else
+    {
+        ::swprintf_s(text, L"%s calls=%ld hr=0x%08lX se=0x%08lX", stage, call_delta,
+            static_cast<unsigned long>(hr), static_cast<unsigned long>(se_code));
+    }
     SplitRegWriteStringIfChanged(kRegSelfTest, text);
 }
 
@@ -558,51 +570,109 @@ static void PublishTargetAddresses(void* slot_address, const InlineDetour& detou
     SplitRegWriteStringIfChanged(kRegTarget, text);
 }
 
-//自检：通过“已经被改过的虚表槽”调用一次 Arrange，确认我们的函数真的被执行了，
-//并且原函数开头被搬走的指令在 trampoline 上还能正常跑完。
-//返回 0 = 通过；否则返回失败步骤码，由调用方写进注册表，插件那边直接显示成中文。
-static int ValidateHook()
+//自检的结果：补丁留不留 + 该报哪个进度码。
+struct SelfCheck
 {
+    bool keep_hook{ false };    //false = 把补丁拆掉（我们不确信它是好的，不能留在 explorer 里）
+    DWORD step{ 0 };            //0 = 通过（由调用方写成 kStepHookInstalled）；非 0 = 直接写进注册表的进度码
+};
+
+//自检（2026-11-06 重做）：
+//以前是“重新取一次探针的虚表槽，调它”，两个坑：
+//  ① 探针是个没 Measure 过、也没挂在任何窗口上的孤儿 Rectangle，XAML 自己走进 Arrange 就飞了，
+//     崩了到底是“补丁坏了”还是“探针本来就不能用”分不开 —— 实测连报 241、calls=0，
+//     而注册表里补丁字节明明是活的（E9 跳进我们的函数）。
+//  ② 拆掉补丁的权力交给了一个本身就不靠谱的调用。
+//现在的顺序：先做“不执行任何代码”的地址对照（S/V/A/H），再用 trampoline 打一发基线（判断探针到底能不能用），
+//最后才踩“真正下了补丁的那个地址”（不是重新读虚表槽 —— 踩自己改过的地址才是唯一的自检目标）。
+//每一步的结论都写进 SelfTest，keep_hook 决定补丁留不留。
+static SelfCheck ValidateHook(void* install_slot)
+{
+    SelfCheck result;
     try
     {
         xaml_shapes::Rectangle probe;
         UIElement ui_element{ probe };
         void* abi = winrt::get_abi(ui_element);
         void** vtable = *reinterpret_cast<void***>(&abi);
-        Arrange_func slot = reinterpret_cast<Arrange_func>(vtable[kIUIElementArrangeSlot]);
+        const uintptr_t probe_slot = reinterpret_cast<uintptr_t>(vtable[kIUIElementArrangeSlot]);
+        void* const patch_at = DetourPatchAddress(g_detour);
 
-        const long before = g_arrange_call_count.load();
+        //把“挂钩时读的槽 / 探针现在的槽 / 补丁地址 / 我们的钩子”四个地址一次性写出来。
+        //S 和 V 不相等 = 这个虚表槽每个对象各有一份（各自的小转发），那我们改的那一份
+        //压根不是任务栏按钮走的那一份 —— 换成再多的自检也测不出来，只能换找挂钩点的办法。
+        wchar_t addrs[256]{};
+        ::swprintf_s(addrs,
+            L"S:0x%016llX V:0x%016llX %s A:0x%016llX H:0x%016llX",
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(install_slot)),
+            static_cast<unsigned long long>(probe_slot),
+            (probe_slot == reinterpret_cast<uintptr_t>(install_slot)) ? L"V=S" : L"V!=S",
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(patch_at)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(&ArrangeHook)));
+
+        if (patch_at == nullptr)
+        {
+            PublishSelfTest(L"no_patch", 0, static_cast<HRESULT>(E_UNEXPECTED), 0, addrs);
+            result.step = kStepDetourBadArgs;
+            return result;                //keep_hook 保持 false
+        }
+
+        //一次“踩一脚”，回来时 delta = 期间进过我们钩子的次数，out_hr/out_se = 现场
+        auto Stomp = [&](Arrange_func func, float size, long* delta, HRESULT* out_hr, DWORD* out_se) -> bool
+        {
+            const long before = g_arrange_call_count.load();
+            const bool ok = SafeCall(func, abi, Rect{ 0.0f, 0.0f, size, size }, out_hr, out_se);
+            *delta = g_arrange_call_count.load() - before;
+            return ok;
+        };
+
+        //①基线：只走 trampoline（原函数的真身，完全不经过我们的代码）。
+        //  这一脚就崩 = 孤儿探针本身不能拿来排版，跟补丁无关；
+        //  再多踩几次只是让 explorer 多吐几个异常，一点信息都换不来 —— 收工，补丁留着（字节已回读核对过），
+        //  真凭据是后面任务栏自己排一次版（进度码 40）。
+        long delta{};
         HRESULT hr{};
         DWORD se_code{};
-        //这一脚踩下去要么进我们的函数（计数 +1），要么直接崩；两种都算“没确认成功”，但原因要分开报
-        if (!SafeCall(slot, abi, Rect{ 0.0f, 0.0f, 40.0f, 40.0f }, &hr, &se_code))
+        if (!Stomp(g_arrange_original, 40.0f, &delta, &hr, &se_code))
         {
-            PublishSelfTest(L"crash", g_arrange_call_count.load() - before, hr, se_code);
-            return static_cast<int>(kStepSelfCallCrashed);
-        }
-        const long delta = g_arrange_call_count.load() - before;
-        if (delta == 0)
-        {
-            //正常返回了却一次都没进我们的函数 = 补丁不在这条调用路径上
-            PublishSelfTest(L"nohook", delta, hr, se_code);
-            return static_cast<int>(kStepSelfCallNotHooked);
+            PublishSelfTest(L"probe_unsafe", delta, hr, se_code, addrs);
+            result.keep_hook = true;
+            result.step = kStepSelfCallProbeUnsafe;
+            return result;
         }
 
-        //再直接走一遍 trampoline，确保搬走的指令是好的
-        se_code = 0;
-        if (!SafeCall(g_arrange_original, abi, Rect{ 0.0f, 0.0f, 42.0f, 42.0f }, &hr, &se_code))
+        //②踩“真正下了补丁的地址”。第一条指令就是我们写的 jmp，理论上必定进钩子：
+        //  计数动了 = 挂钩点和钩子本体都是好的（哪怕随后在 XAML 深处崩，那也是孤儿探针的锅）；
+        //  计数没动还没崩 = 那段字节被执行了却没跳到我们这儿（写进去的不是真的 / 页被还原）；
+        //  计数没动且崩了   = 头几个字节本身就是坏的，必须马上拆，不然 explorer 迟早栽在它手上。
+        long hook_delta{};
+        const bool hook_ok = Stomp(reinterpret_cast<Arrange_func>(patch_at), 41.0f, &hook_delta, &hr, &se_code);
+        if (hook_delta > 0)
         {
-            PublishSelfTest(L"tramp", g_arrange_call_count.load() - before, hr, se_code);
-            return static_cast<int>(kStepTrampolineFailed);
+            PublishSelfTest(hook_ok ? L"hook_ok" : L"hooked_then_probe_crash", hook_delta, hr, se_code, addrs);
+            result.keep_hook = true;
+            result.step = 0;
+            return result;
         }
-        PublishSelfTest(L"ok", g_arrange_call_count.load() - before, hr, se_code);
-        return 0;
+        if (!hook_ok)
+        {
+            PublishSelfTest(L"patch_dead_crash", hook_delta, hr, se_code, addrs);
+            result.keep_hook = false;
+            result.step = kStepSelfCallHookFaulted;
+            return result;
+        }
+        PublishSelfTest(L"patch_dead_clean", hook_delta, hr, se_code, addrs);
+        result.keep_hook = false;
+        result.step = kStepSelfCallNotHooked;
+        return result;
     }
     catch (...)
     {
         //建探针对象/取虚表就抛了，这个线程里的 XAML 运行时状态有问题
-        PublishSelfTest(L"cpp", 0, static_cast<HRESULT>(E_UNEXPECTED), 0);
-        return static_cast<int>(kStepSelfCallThrew);
+        PublishSelfTest(L"cpp", 0, static_cast<HRESULT>(E_UNEXPECTED), 0, nullptr);
+        result.keep_hook = false;
+        result.step = static_cast<DWORD>(kStepSelfCallThrew);
+        return result;
     }
 }
 
@@ -722,17 +792,20 @@ bool InstallTaskbarSplit()
     }
 
     g_hook_installed = true;
-    const int validate_result = ValidateHook();
-    if (validate_result != 0)
+    const SelfCheck check = ValidateHook(arrange_address);
+    if (!check.keep_hook)
     {
         //自检没过必须把“已挂钩”这个状态收回：否则下次再装会以为已经装好直接返回，
         //而且 explorer 里还留着指向我们代码的跳转。
         RestoreDetourBytes();
         g_hook_installed = false;
-        SplitRegWriteDwordIfChanged(kRegStep, static_cast<DWORD>(validate_result));
+        SplitRegWriteDwordIfChanged(kRegStep, check.step != 0 ? check.step : kStepSelfCallMissed);
         return false;
     }
-    SplitRegWriteDwordIfChanged(kRegStep, kStepHookInstalled);
+    //245 = 补丁保住了，但孤儿探针排不了版，自检这条路给不出结论；
+    //这种时候不能报“挂钩成功”（他没看到过），也不能报“失败”（会去拆一个我们确信写进去了的补丁），
+    //所以原样把 245 写出去，插件那句话会解释清楚。
+    SplitRegWriteDwordIfChanged(kRegStep, check.step != 0 ? check.step : kStepHookInstalled);
     return true;
 }
 

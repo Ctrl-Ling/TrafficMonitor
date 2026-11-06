@@ -1,4 +1,7 @@
-﻿#include "framework.h"
+﻿// Author: Ctrl-Ling
+// Last Modified By: Ctrl-Ling
+// Last Modified At: 2026-11-06 14:34:41 +08:00
+#include "framework.h"
 #include <cstdio>
 #include <cwchar>
 #include "resource.h"
@@ -33,9 +36,11 @@ static const wchar_t* HelperStepText(int step)
     case kStepDetourProtect:      return L"内联跳转装不上：改不动函数代码页的写权限";
     case kStepDetourNotWritten:   return L"内联跳转装不上：补丁字节写不进去（写完读回来不是我们写的）";
     case kStepSelfCallMissed:     return L"自检失败：调用该槽位没进我们的函数（挂钩点不对）";
-    case kStepSelfCallCrashed:    return L"自检失败：调用该槽位当场崩了，还没进我们的函数（异常码见注册表 TaskbarSplitSelfTest 的 se=）";
-    case kStepSelfCallNotHooked:  return L"自检失败：调用正常返回，但一次都没进我们的函数 —— 补丁不在调用路径上（现场见 TaskbarSplitTarget / SelfTest）";
+    case kStepSelfCallCrashed:    return L"（旧版）自检：调用该槽位当场崩了，还没进我们的函数（异常码见注册表 TaskbarSplitSelfTest 的 se=）";
+    case kStepSelfCallNotHooked:  return L"自检失败：踩补丁地址能正常返回，但一次都没进我们的函数 —— 那几个字节没被执行（现场见 TaskbarSplitTarget / SelfTest）";
     case kStepSelfCallThrew:      return L"自检失败：建探针对象或取虚表时抛异常（这个线程的 XAML 运行时状态不对）";
+    case kStepSelfCallHookFaulted: return L"自检失败：原函数跑得好好的，一踩我们改过的地址就崩 —— 搬走的指令有问题，已自动拆掉补丁（四个地址见 TaskbarSplitSelfTest）";
+    case kStepSelfCallProbeUnsafe: return L"补丁已写入并核对过，但自检用的临时控件本身排不了版（走原函数也崩），改没改到位要等任务栏真的排一次版才知道；这期间不动 Windows 的对齐设置";
     case kStepTrampolineFailed:   return L"自检失败：搬走的指令在 trampoline 上跑不动";
     case kStepHookInstalled:      return L"挂钩成功，等任务栏排一次版就真正钉住";
     case kStepPinning:            return L"正在钉住：系统按钮已经过挂钩";

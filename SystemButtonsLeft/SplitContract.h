@@ -1,4 +1,7 @@
-﻿#pragma once
+﻿// Author: Ctrl-Ling
+// Last Modified By: Ctrl-Ling
+// Last Modified At: 2026-11-06 14:34:41 +08:00
+#pragma once
 #include <windows.h>
 
 //// “win按钮居左，软件图标居中”插件与它注入到 explorer.exe 的助手 DLL 之间的约定。
@@ -27,7 +30,7 @@ static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ
 static constexpr const wchar_t* kRegStep = L"TaskbarSplitStep";         //REG_DWORD 助手走到哪一步了（见下面的 kStep*），插件选项对话框直接显示这句话
 static constexpr const wchar_t* kRegPrologue = L"TaskbarSplitPrologue"; //REG_SZ 挂钩现场字节：S:=虚表槽地址（函数入口）开头24字节 A:=真正下补丁地址开头24字节（reg query 就能看到）
 static constexpr const wchar_t* kRegTarget = L"TaskbarSplitTarget";     //REG_SZ S:=槽地址 T:=函数入口 A:=补丁地址（T+3 说明入口是 endbr64 没被盖）M:=模块基址，S-M 就是该函数的 RVA
-static constexpr const wchar_t* kRegSelfTest = L"TaskbarSplitSelfTest"; //REG_SZ 自检现场：哪一步失败、计数加了几、HRESULT、以及 SEH 异常码（0xC000061B=CET 控制保护异常）
+static constexpr const wchar_t* kRegSelfTest = L"TaskbarSplitSelfTest"; //REG_SZ 自检现场：stage（probe_unsafe/patch_dead_crash/patch_dead_clean/hook_ok/hooked_then_probe_crash）+ 计数增量 + HRESULT + SEH 异常码 + S:/V:/A:/H: 四个地址（V!=S 说明虚表槽每对象一份）
 
 // 助手的进度码：挂钩这件事跨了两个进程，出错时只看“没生效”没法定位，
 // 所以每过一个里程碑就写一个数，插件把数字翻译成中文显示出来。
@@ -57,9 +60,13 @@ static constexpr DWORD kStepDetourNotWritten = 238;     //补丁写完读回来�
 
 //“自检没通过”的细分：24*10 + 原因号。24 本身分不清是“调用炸了”还是“调用没走我们”，
 //这两种的下一步做法完全相反，所以必须拆开。
-static constexpr DWORD kStepSelfCallCrashed = 241;      //自检：调用槽位时崩了（没进钩子就挂了）
-static constexpr DWORD kStepSelfCallNotHooked = 242;    //自检：调用正常返回，但一次都没进我们的钩子（补丁不在调用路径上）
+//自检用的探针对象是“孤儿”（没 Measure 过、也没挂在任何窗口上），XAML 自己走进 Arrange 都可能飞，
+//所以 241 那种“一踩就崩”并不能证明补丁是坏的——245 就是把这条说清楚：崩在探针身上，补丁照留。
+static constexpr DWORD kStepSelfCallCrashed = 241;      //（旧）自检：调用槽位时崩了（没进钩子就挂了）
+static constexpr DWORD kStepSelfCallNotHooked = 242;    //自检：踩补丁地址正常返回，但一次都没进我们的钩子（那段字节没被执行）
 static constexpr DWORD kStepSelfCallThrew = 243;        //自检：建探针对象/取虚表这一步抛了 C++ 异常
+static constexpr DWORD kStepSelfCallHookFaulted = 244;  //自检：基线（原函数）好好的，一踩补丁地址就崩且没进钩子 —— 头几个字节是坏的，已拆
+static constexpr DWORD kStepSelfCallProbeUnsafe = 245;  //自检：孤儿探针连原函数都排不动（走 trampoline 基线就崩）—— 补丁保留，结论等真实排版（40）
 
 // 助手 DLL 的文件名。它不是 TM 插件，必须和 plugins 目录分开（否则 TM 的插件管理会去
 // 找它的 TMPluginGetInstance 并报“函数获取失败 127”），放在 TrafficMonitor.exe 同级目录。
