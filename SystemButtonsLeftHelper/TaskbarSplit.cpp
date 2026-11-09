@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-06 14:34:41 +08:00
+// Last Modified At: 2026-11-09 17:22:36 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -14,6 +14,7 @@
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.Shapes.h>
 #include <cwctype>
+#include <cmath>        //std::abs/std::lround/std::isfinite：块宽（DIP）的比较与换算
 #include <cstdio>       //swprintf_s：把自检现场拼成一句话写进注册表
 #include <mutex>
 
@@ -54,6 +55,9 @@ static std::atomic<bool> g_seen_taskbar_button{ false };
 static std::atomic<double> g_block_width_dip{ 0.0 };
 static std::atomic<double> g_last_published_dip{ -1.0 };
 static std::atomic<long> g_arrange_call_count{ 0 };
+//左侧按钮块里每个按钮“右边沿到哪儿了”（DIP），下标 = (int)SystemButton。
+//块宽不是算出来的，是这四个按钮各自报上来的右边沿里最大的那个。
+static std::atomic<double> g_button_right_edge_dip[4]{ 0.0, 0.0, 0.0, 0.0 };
 static thread_local bool g_in_hook{ false };
 
 //第一次真的看到任务栏按钮经过挂钩，说明“钉住”这件事在当前的 explorer 里成立了，
@@ -145,6 +149,8 @@ void RestoreMarginsAsync()
     }
 
     g_block_width_dip = 0.0;
+    for (auto& edge : g_button_right_edge_dip)
+        edge = 0.0;
     g_last_published_dip = -1.0;
     SplitRegWriteDwordIfChanged(kRegBlock, 0u);
 }
@@ -405,6 +411,49 @@ static void PublishBlockWidth(double width_dip)
     SplitRegWriteDword(kRegBlock, block);
 }
 
+//某个按钮报上自己的右边沿（DIP）：把它那一格记下来，块宽取四格里最大的那格。
+//为什么用 Arrange 矩形自己的 X+Width：排版器把按钮放到这个矩形里，最终就是这个矩形说了算；
+//以前是拿 ComputeClusterOffset + GetButtonExtent 另算一套（DesiredSize 会跟着天气文字、悬停宽度上下飘），
+//而且只会变大不会变小 —— 实测注册表里长期挂着 348，而小组件真实右边沿只有 285，
+//TM 把窗口钉在这个数后面就一会儿空一条、一会儿压住小组件。
+static void UpdateBlockEnd(SystemButton button, double right_edge_dip)
+{
+    const int index = static_cast<int>(button);
+    if (index < 0 || index >= 4 || !std::isfinite(right_edge_dip) || right_edge_dip <= 0.0)
+        return;
+    if (std::abs(right_edge_dip - g_button_right_edge_dip[index].load()) < 0.05)
+        return;         //这一格没变，不用重算也不用写注册表
+    g_button_right_edge_dip[index] = right_edge_dip;
+
+    double block = 0.0;
+    for (int i = 0; i < 4; i++)
+    {
+        const double edge = g_button_right_edge_dip[i].load();
+        if (edge > block)
+            block = edge;
+    }
+    g_block_width_dip = block;
+    PublishBlockWidth(block);
+}
+
+//某个按钮不见了（比如小组件被关掉）：清掉那一格，块宽才能跟着缩回去
+static void ClearBlockEnd(SystemButton button)
+{
+    const int index = static_cast<int>(button);
+    if (index < 0 || index >= 4 || g_button_right_edge_dip[index].load() == 0.0)
+        return;
+    g_button_right_edge_dip[index] = 0.0;
+    double block = 0.0;
+    for (int i = 0; i < 4; i++)
+    {
+        const double edge = g_button_right_edge_dip[i].load();
+        if (edge > block)
+            block = edge;
+    }
+    g_block_width_dip = block;
+    PublishBlockWidth(block);
+}
+
 //Arrange 挂钩：排版器每次给按钮定位都会走到这里
 static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
 {
@@ -435,22 +484,14 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
             RememberTouched(element);
             if (WidgetsPositionNeedsUpdate(element, enabled))
                 PostToTaskbarThread(element, UpdateWidgetsPosition, enabled);
+            //小组件是这一组里最右边的一个，块宽基本就是它的右边沿。
+            //这里直接用排版器给它的矩形（X+Width），不再自己按 DesiredSize 估：
+            //估出来的值会跟着天气文字的显示/隐藏上下飘，而且旧写法只增不减，
+            //结果注册表里长期挂着一个比实际大 60 多 DIP 的数，TM 的窗口就一会儿空一条、一会儿压住小组件。
             if (enabled)
-            {
-                auto frame = xaml_media::VisualTreeHelper::GetParent(element).try_as<FrameworkElement>();
-                if (frame)
-                {
-                    bool vertical = IsVerticalTaskbar(frame);
-                    double end = ComputeClusterOffset(frame, SystemButton::Widgets, vertical) +
-                        GetButtonExtent(element, vertical);
-                    double current = g_block_width_dip.load();
-                    if (end > current)
-                    {
-                        g_block_width_dip = end;
-                        PublishBlockWidth(end);
-                    }
-                }
-            }
+                UpdateBlockEnd(SystemButton::Widgets, rect.X + rect.Width);
+            else
+                ClearBlockEnd(SystemButton::Widgets);
             return g_arrange_original(p_this, rect);
         }
 
@@ -464,7 +505,10 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
             PostToTaskbarThread(element, UpdateClusterCollapse, enabled);
 
         if (!enabled)
+        {
+            ClearBlockEnd(button);
             return g_arrange_original(p_this, rect);
+        }
 
         auto frame = xaml_media::VisualTreeHelper::GetParent(element).try_as<FrameworkElement>();
         if (!frame)
@@ -472,22 +516,19 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
 
         bool vertical = IsVerticalTaskbar(frame);
         double offset = ComputeClusterOffset(frame, button, vertical);
-        double end = offset + GetButtonExtent(element, vertical);
 
         Rect new_rect = rect;
+        //把按钮摆到“前面几个按钮排完之后”的位置；块宽就记这个矩形自己的右边沿
         if (vertical)
         {
             new_rect.Y = static_cast<float>(offset);
-            if (end > g_block_width_dip.load())
-                g_block_width_dip = end;
+            UpdateBlockEnd(button, static_cast<double>(new_rect.X) + new_rect.Width);
         }
         else
         {
             new_rect.X = static_cast<float>(offset);
-            if (end > g_block_width_dip.load())
-                g_block_width_dip = end;
+            UpdateBlockEnd(button, static_cast<double>(new_rect.X) + new_rect.Width);
         }
-        PublishBlockWidth(g_block_width_dip.load());
 
         return g_arrange_original(p_this, new_rect);
     }
@@ -594,7 +635,11 @@ static SelfCheck ValidateHook(void* install_slot)
         xaml_shapes::Rectangle probe;
         UIElement ui_element{ probe };
         void* abi = winrt::get_abi(ui_element);
-        void** vtable = *reinterpret_cast<void***>(&abi);
+        //注意是“取 abi 指向的虚表指针”，不是“取存放 abi 的那个局部变量的值”——
+        //写成 &abi 就等于把接口指针本身当虚表，往后数 92 格拿到的是完全无关的字节：
+        //以前自检“一踩就崩、calls=0、se=0xC0000005”就是这么来的（崩在一个随机数当函数指针上），
+        //跟补丁、跟着陆垫都没关系，却把已经写好的补丁给拆了。
+        void** vtable = *reinterpret_cast<void***>(abi);
         const uintptr_t probe_slot = reinterpret_cast<uintptr_t>(vtable[kIUIElementArrangeSlot]);
         void* const patch_at = DetourPatchAddress(g_detour);
 
@@ -816,6 +861,8 @@ void RemoveTaskbarSplit()
     g_hook_installed = false;
     g_seen_taskbar_button = false;
     g_block_width_dip = 0.0;
+    for (auto& edge : g_button_right_edge_dip)
+        edge = 0.0;
     g_last_published_dip = -1.0;
     SplitRegWriteDwordIfChanged(kRegStep, kStepNone);
 }

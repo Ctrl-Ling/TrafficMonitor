@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-06 14:34:41 +08:00
+// Last Modified At: 2026-11-09 17:22:36 +08:00
 #pragma once
 #include <windows.h>
 
@@ -25,7 +25,7 @@ static constexpr const wchar_t* kRegReqSeq = L"TaskbarSplitReqSeq";     //REG_DW
 static constexpr const wchar_t* kRegAckSeq = L"TaskbarSplitAckSeq";     //REG_DWORD 助手已经处理完的请求序号（等于 kRegReqSeq 表示这一轮做完了）
 static constexpr const wchar_t* kRegActive = L"TaskbarSplitActive";     //REG_DWORD 1：助手已在当前 explorer.exe 里挂钩成功
 static constexpr const wchar_t* kRegPid = L"TaskbarSplitPid";           //REG_DWORD 助手所在进程（explorer）的ID
-static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的宽度，单位 1/100 DIP
+static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的右边界，单位 1/100 DIP（= 最右边那个按钮排版矩形的 X+Width，TM 任务栏窗口就紧跟在这条线后面）
 static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ 调试信息：助手在任务栏上看到的控件类型名
 static constexpr const wchar_t* kRegStep = L"TaskbarSplitStep";         //REG_DWORD 助手走到哪一步了（见下面的 kStep*），插件选项对话框直接显示这句话
 static constexpr const wchar_t* kRegPrologue = L"TaskbarSplitPrologue"; //REG_SZ 挂钩现场字节：S:=虚表槽地址（函数入口）开头24字节 A:=真正下补丁地址开头24字节（reg query 就能看到）

@@ -1,4 +1,6 @@
-﻿#include "stdafx.h"
+﻿// Last Modified At: 2026-11-09 17:22:36 +08:00
+// Last Modified By: Ctrl-Ling
+#include "stdafx.h"
 #include "Win11TaskbarDlg.h"
 #include "WindowsSettingHelper.h"
 
@@ -55,7 +57,9 @@ void CWin11TaskbarDlg::AdjustTaskbarWndPos(bool force_adjust)
         //任务栏窗口显示在左侧时
         else if (split_active && split_block_width > 0)     //拆分器生效：紧跟在左侧系统按钮块后面
         {
-            m_rect.MoveToX(DPI(split_block_width + 2));
+            //块宽是助手从“按钮自己的排版矩形右边沿”报上来的（DIP），已经是最右边那个按钮的真实右边界；
+            //这里再留 8 DIP：最右边的小组件按钮有一圈透明的一键点击区，紧贴着放会把这一小块盖住。
+            m_rect.MoveToX(DPI(split_block_width + 8));
         }
         else
         {
