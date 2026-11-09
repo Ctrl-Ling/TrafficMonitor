@@ -1,4 +1,7 @@
-﻿#pragma once
+﻿// Author: Ctrl-Ling
+// Last Modified By: Ctrl-Ling
+// Last Modified At: 2026-11-09 17:39:27 +08:00
+#pragma once
 #include "framework.h"
 #include "PluginInterface.h"
 #include <string>
@@ -22,6 +25,9 @@ public:
     virtual OptionReturn ShowOptionsDialog(void* hParent) override;
     virtual void OnExtenedInfo(ExtendedInfoIndex index, const wchar_t* data) override;
     virtual void OnInitialize(ITrafficMonitor* pApp) override;
+    //本体每次采集完数据都会在本体的界面线程上调用这里（不是定时器，是本体现成的节奏），
+    //借这个点把“TM 任务栏窗口紧跟左侧按钮块”的子类化挂好/挪到新窗口上
+    virtual void OnMonitorInfo(const MonitorInfo& monitor_info) override;
 
 private:
     ITrafficMonitor* m_app{};

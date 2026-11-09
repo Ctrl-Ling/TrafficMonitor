@@ -1,7 +1,11 @@
-﻿#include "framework.h"
+﻿// Author: Ctrl-Ling
+// Last Modified By: Ctrl-Ling
+// Last Modified At: 2026-11-09 17:39:27 +08:00
+#include "framework.h"
 #include <cstring>
 #include <shlwapi.h>
 #include "TaskbarSplitController.h"
+#include "TaskbarWndAnchor.h"
 #include "PluginInterface.h"
 #include "SplitContract.h"
 
@@ -87,6 +91,13 @@ CTaskbarSplitController& CTaskbarSplitController::Instance()
 {
     static CTaskbarSplitController instance;
     return instance;
+}
+
+void CTaskbarSplitController::SetApp(ITrafficMonitor* app)
+{
+    m_app = app;
+    //窗口锚定模块需要它来取“TM 自己的任务栏窗口”句柄和任务栏 DPI
+    CTaskbarWndAnchor::SetApp(app);
 }
 
 void CTaskbarSplitController::SetConfigFile(const std::wstring& ini_path)
@@ -350,6 +361,10 @@ bool CTaskbarSplitController::Apply(bool enable, std::wstring& msg)
 
     RefreshStatus();
 
+    //这里在 TM 自己的界面线程上，趁机把窗口锚定挂好/摘好（选项对话框、启动时的 LoadConfigAndApply 都在这个线程）。
+    //任务栏窗口还没建起来也没关系，之后本体的每帧回调 OnMonitorInfo 会再 Sync 一次。
+    CTaskbarWndAnchor::Sync();
+
     //保存插件自己的设置
     if (!m_ini_file.empty())
     {
@@ -402,7 +417,10 @@ void CTaskbarSplitController::RefreshStatus()
         ::GetWindowThreadProcessId(tray, &tray_pid);
     //助手上报的进程必须就是当前任务栏所在进程，否则 explorer 已经重启过、状态是旧的
     m_status.split_active = (active != 0 && helper_pid != 0 && tray_pid != 0 && helper_pid == tray_pid);
-    m_status.block_width = m_status.split_active ? static_cast<int>(SplitRegReadDword(kRegBlock, 0) / 100) : 0;
+    m_status.block_width_100 = m_status.split_active ? static_cast<int>(SplitRegReadDword(kRegBlock, 0)) : 0;
+    m_status.block_width = m_status.block_width_100 / 100;
+    //把按钮块的右边界交给窗口锚定模块——TM 的任务栏窗口就摆在这条线后面（这一步不需要主程序参与）
+    CTaskbarWndAnchor::UpdateState(m_status.split_active, m_status.block_width_100);
     //诊断码只有“当前这个 explorer 里的助手”写过的才算数：进程号对不上就是 explorer 重启后留下的旧值
     m_status.helper_step = (helper_pid != 0 && helper_pid == tray_pid)
         ? static_cast<int>(SplitRegReadDword(kRegStep, 0)) : 0;

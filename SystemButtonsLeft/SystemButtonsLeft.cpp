@@ -1,6 +1,10 @@
-﻿#include "framework.h"
+﻿// Author: Ctrl-Ling
+// Last Modified By: Ctrl-Ling
+// Last Modified At: 2026-11-09 17:39:27 +08:00
+#include "framework.h"
 #include "SystemButtonsLeft.h"
 #include "TaskbarSplitController.h"
+#include "TaskbarWndAnchor.h"
 #include "OptionsDialog.h"
 
 extern HMODULE g_plugin_module;
@@ -61,6 +65,13 @@ void CSystemButtonsLeftPlugin::OnInitialize(ITrafficMonitor* pApp)
 {
     m_app = pApp;
     CTaskbarSplitController::Instance().SetApp(pApp);
+}
+
+//这个调用点在本体的界面线程上，正好是挂/摘窗口子类的安全位置。
+//本体把任务栏窗口关掉又打开时句柄会变，这里跟着挪一次。
+void CSystemButtonsLeftPlugin::OnMonitorInfo(const MonitorInfo& monitor_info)
+{
+    CTaskbarWndAnchor::Sync();
 }
 
 void CSystemButtonsLeftPlugin::OnExtenedInfo(ExtendedInfoIndex index, const wchar_t* data)

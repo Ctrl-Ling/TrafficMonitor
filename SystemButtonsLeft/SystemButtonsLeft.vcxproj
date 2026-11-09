@@ -238,12 +238,14 @@
     <ClInclude Include="SplitContract.h" />
     <ClInclude Include="SystemButtonsLeft.h" />
     <ClInclude Include="TaskbarSplitController.h" />
+    <ClInclude Include="TaskbarWndAnchor.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="OptionsDialog.cpp" />
     <ClCompile Include="SystemButtonsLeft.cpp" />
     <ClCompile Include="TaskbarSplitController.cpp" />
+    <ClCompile Include="TaskbarWndAnchor.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="SystemButtonsLeft.rc" />

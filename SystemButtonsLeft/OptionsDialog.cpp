@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-09 17:22:36 +08:00
+// Last Modified At: 2026-11-09 17:39:27 +08:00
 #include "framework.h"
 #include <cstdio>
 #include <cwchar>
@@ -80,8 +80,23 @@ static void RefreshStatusLines(HWND hDlg)
     const wchar_t* result = CTaskbarSplitController::Instance().LastMessage().c_str();
     SetStatusLine(hDlg, IDC_STATUS_LINE5, result);
 
-    ::swprintf_s(buf, L"诊断（%d）：%s", st.helper_step, HelperStepText(st.helper_step));
-    SetStatusLine(hDlg, IDC_STATUS_LINE6, buf);
+    //诊断这一行同时说两件事：explorer 里的助手卡在哪一步，以及插件这边有没有真的把 TM 的
+    //任务栏窗口搬到按钮块后面（后者全在插件里做，主程序代码不用改）。
+    wchar_t diag[512]{};
+    ::swprintf_s(diag, L"诊断（%d）：%s", st.helper_step, HelperStepText(st.helper_step));
+    wchar_t anchor[256]{};
+    if (SplitRegReadString(kRegWnd, anchor, sizeof(anchor) / sizeof(anchor[0])) && anchor[0] != L'\0')
+    {
+        wchar_t line[512]{};
+        ::swprintf_s(line, L"%s｜窗口跟随：%s", diag, anchor);
+        SetStatusLine(hDlg, IDC_STATUS_LINE6, line);
+    }
+    else
+    {
+        wchar_t line[512]{};
+        ::swprintf_s(line, L"%s｜窗口跟随：还没挂上（任务栏窗口打开后本体下一次刷新就挂）", diag);
+        SetStatusLine(hDlg, IDC_STATUS_LINE6, line);
+    }
 }
 
 static INT_PTR CALLBACK DlgProc(HWND hDlg, UINT message, WPARAM w_param, LPARAM l_param)

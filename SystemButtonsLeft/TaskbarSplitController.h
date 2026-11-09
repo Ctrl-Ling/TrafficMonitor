@@ -1,4 +1,7 @@
-﻿#pragma once
+﻿// Author: Ctrl-Ling
+// Last Modified By: Ctrl-Ling
+// Last Modified At: 2026-11-09 17:39:27 +08:00
+#pragma once
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -17,6 +20,7 @@ struct SplitStatus
     bool helper_injected{ false };  //插件是否已经把钩子挂上
     bool split_active{ false };     //助手已经在 explorer 里挂钩成功
     int block_width{ 0 };           //被钉在左侧的系统按钮块宽度（DIP）
+    int block_width_100{ 0 };       //同一个数的原始精度：按钮块右边界，1/100 DIP（插件摆 TM 任务栏窗口时用它，避免每次截断丢 1 像素）
     int helper_step{ 0 };           //助手走到哪一步了（kStep*），0 表示当前 explorer 里没有助手在跑
     bool taskbar_center_align{ true };   //Windows 自己的“任务栏图标对齐”当前值
 };
@@ -26,12 +30,15 @@ struct SplitStatus
 //   1）把自己的开关状态通过注册表告诉 explorer 里的助手 DLL；
 //   2）把助手 DLL 用 SetWindowsHookEx(WH_GETMESSAGE) 注入 explorer 的任务栏线程；
 //   3）按助手的实际情况切换 Windows 的 TaskbarAl（助手可用时保持“居中”，不可用时退回“靠左”）。
+//   4）把助手报回来的按钮块边界交给 CTaskbarWndAnchor，让 TrafficMonitor 自己的任务栏窗口
+//     紧跟在这个块后面——这一步完全在插件里做，主程序代码不用改。
 class CTaskbarSplitController
 {
 public:
     static CTaskbarSplitController& Instance();
 
-    void SetApp(ITrafficMonitor* app) { m_app = app; }
+    //同时把主程序接口转交给窗口锚定模块（它要靠这个接口拿到 TM 自己的任务栏窗口句柄和 DPI）
+    void SetApp(ITrafficMonitor* app);
     void SetConfigFile(const std::wstring& ini_path);
 
     //读取插件自己的 ini，并把保存下来的开关状态应用到系统上（TM 启动时调用一次）
