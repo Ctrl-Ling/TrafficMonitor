@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-09 17:39:27 +08:00
+// Last Modified At: 2026-11-09 17:55:13 +08:00
 #pragma once
 #include <windows.h>
 
@@ -20,7 +20,7 @@ static constexpr const wchar_t* kRegEnabled = L"TaskbarSplitEnabled";   //REG_DW
 static constexpr const wchar_t* kRegOwnerPid = L"TaskbarSplitOwner";    //REG_DWORD 插件宿主（TrafficMonitor）的进程ID，宿主退出时助手自行复原
 static constexpr const wchar_t* kRegAckEvent = L"TaskbarSplitAckEvent"; //REG_SZ 助手完成安装/复原后置事件的名字，插件等它，不轮询
 static constexpr const wchar_t* kRegReqSeq = L"TaskbarSplitReqSeq";     //REG_DWORD 请求序号：插件每次改动开关就 +1
-static constexpr const wchar_t* kRegWnd = L"TaskbarSplitWnd";           //REG_SZ 插件自己写（助手不读）：窗口跟随诊断，sub=on|off mode=... wnd=0x... par=tray|other active=... block=... x=旧->新。
+static constexpr const wchar_t* kRegWnd = L"TaskbarSplitWnd";           //REG_SZ 插件自己写（助手不读）：窗口跟随诊断，sub=on mode=subclass|manual wnd=0x... par=tray|other active=... block=... x=旧->新，或 sub=off reason=no-app|api-too-old|no-taskbar-wnd。
                                                                         //TM 任务栏窗口靠插件给它挂子类过程来紧跟左侧按钮块，这一行说明那次改写有没有真的发生
 
 // 助手 -> 插件、主程序

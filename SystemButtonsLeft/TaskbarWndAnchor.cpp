@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-09 17:39:27 +08:00
+// Last Modified At: 2026-11-09 17:55:13 +08:00
 #include "framework.h"
 #include <commctrl.h>
 #include <atomic>
@@ -206,15 +206,15 @@ static void AnchorDetach()
 //诊断：一行 ASCII 写进注册表，插件选项里翻译成人话。
 //为什么需要它——以后“TM 窗口没跟上”有三种卡法（没挂上 / 父窗口判定没过 / 数不对），
 //不看这一行就得再来一轮编译才能分清，所以每次状态变化都记下来。
-static void PublishDiag(HWND taskbar_wnd)
+//reason 非空表示这次根本没挂上，并把原因写在同一行里（老宿主接口太旧、任务栏窗口没显示……），
+//省得以后看到 sub=off 还得猜是哪一种。
+static void PublishDiag(HWND taskbar_wnd, const wchar_t* reason)
 {
     wchar_t text[256]{};
     const bool attached = (g_subclassed != nullptr);
-    if (g_app == nullptr)
-        ::swprintf_s(text, L"sub=off reason=no-app");
-    else if (taskbar_wnd == nullptr)
-        ::swprintf_s(text, L"sub=off reason=no-taskbar-wnd active=%d block=%d",
-            g_split_active.load() ? 1 : 0, g_block_100.load());
+    if (reason != nullptr)
+        ::swprintf_s(text, L"sub=off reason=%s active=%d block=%d",
+            reason, g_split_active.load() ? 1 : 0, g_block_100.load());
     else
         ::swprintf_s(text, L"sub=%s mode=%s wnd=0x%llX par=%s active=%d block=%d x=%ld->%ld",
             attached ? L"on" : L"off",
@@ -231,7 +231,7 @@ void CTaskbarWndAnchor::Sync()
     if (g_app == nullptr)
     {
         if (g_diag_dirty.exchange(false))
-            PublishDiag(nullptr);
+            PublishDiag(nullptr, L"no-app");
         return;
     }
     //取任务栏窗口句柄是接口 v1 才加的（它是 ITrafficMonitor 最后两个虚函数之一），
@@ -240,7 +240,7 @@ void CTaskbarWndAnchor::Sync()
     {
         AnchorDetach();
         if (g_diag_dirty.exchange(false))
-            PublishDiag(nullptr);
+            PublishDiag(nullptr, L"api-too-old");
         return;
     }
 
@@ -258,5 +258,5 @@ void CTaskbarWndAnchor::Sync()
     }
 
     if (g_diag_dirty.exchange(false))
-        PublishDiag(taskbar_wnd);
+        PublishDiag(taskbar_wnd, taskbar_wnd == nullptr ? L"no-taskbar-wnd" : nullptr);
 }
