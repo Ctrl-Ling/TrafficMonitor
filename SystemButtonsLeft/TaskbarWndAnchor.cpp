@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-09 17:55:13 +08:00
+// Last Modified At: 2026-11-10 10:55:00 +08:00
 #include "framework.h"
 #include <commctrl.h>
 #include <atomic>
@@ -19,6 +19,9 @@
 static constexpr UINT_PTR kAnchorSubclassId = 0x5CA1;
 //按钮块右边界之后留给 TM 任务栏窗口的间距（DIP）
 static constexpr int kAnchorGapDip = 8;
+//TM 主程序给任务栏窗口设的标题（TaskBarDlg.cpp 里 SetWindowText(TASKBAR_WINDOW_NAME)）。
+//官方发布版的宿主接口还停在 v0，拿不到句柄，就靠这个标题自己找。
+static constexpr const wchar_t* kTaskbarWndTitle = L"TrafficMonitorTaskbarWindow";
 
 //以下三个是跨线程的：控制器的工作线程只写这几个原子量（UpdateState / SetApp），
 //界面线程（窗口过程、Sync）读；注册表、窗口这些真正的动作都留在界面线程上做。
@@ -34,6 +37,8 @@ static bool g_manual_mode{ false };
 static bool g_parent_is_primary_tray{ false };   //最后一次判断：父窗口是不是主屏任务栏
 static long g_last_x_before{};
 static long g_last_x_after{};
+static int g_api_version{};                      //宿主的接口版本（诊断用）
+static const wchar_t* g_found_by{ L"none" };     //任务栏窗口句柄是哪一路拿到的：api / title / none
 
 void CTaskbarWndAnchor::SetApp(ITrafficMonitor* app)
 {
@@ -86,6 +91,71 @@ static bool GetAnchorX(HWND hwnd, long* out_x)
     }
     *out_x = ::MulDiv(block + kAnchorGapDip * 100, dpi, 9600);
     return true;
+}
+
+//宿主观测不到任务栏窗口句柄时（官方发布版的 ITrafficMonitor 还是 v0，没有 GetTaskbarWindowHwnd），
+//按窗口标题在本进程的窗口里自己找。
+//限定“进程号 = 自己”：别的程序就算抄了这个标题也找不到我们头上；
+//再优先挑父窗口是主屏 Shell_TrayWnd 的那个，副屏任务栏窗口（父窗口是 Shell_SecondaryTrayWnd）不会被选中。
+struct TaskbarWndSearch
+{
+    HWND tray;
+    HWND strict;      //父窗口就是主屏任务栏的
+    HWND loose;       //同标题、同进程的任意一个（嵌入失败或还没挂上去时的备胎）
+};
+
+static BOOL CALLBACK EnumTaskbarWndProc(HWND hwnd, LPARAM l_param)
+{
+    auto* search = reinterpret_cast<TaskbarWndSearch*>(l_param);
+    DWORD pid = 0;
+    if (::GetWindowThreadProcessId(hwnd, &pid) == 0 || pid != ::GetCurrentProcessId())
+        return TRUE;
+    wchar_t text[64]{};
+    if (::GetWindowTextW(hwnd, text, 64) <= 0)
+        return TRUE;
+    if (::lstrcmpiW(text, kTaskbarWndTitle) != 0)
+        return TRUE;
+    if (search->loose == nullptr)
+        search->loose = hwnd;
+    if (::GetAncestor(hwnd, GA_PARENT) == search->tray)
+        search->strict = hwnd;
+    return TRUE;
+}
+
+static HWND FindOwnTaskbarWnd()
+{
+    TaskbarWndSearch search{};
+    search.tray = ::FindWindowW(L"Shell_TrayWnd", nullptr);
+    ::EnumWindows(&EnumTaskbarWndProc, reinterpret_cast<LPARAM>(&search));
+    return search.strict != nullptr ? search.strict : search.loose;
+}
+
+//块宽变了、但主程序这一次没有重新摆窗口（它只在通知区宽度/开始按钮位置变了才摆），
+//就当场替它摆一次。判断只用当前状态比较，不记标志位：值已经对了就一个消息都不发，
+//所以不会和主程序自己发的移动来回打架。
+static void ApplyAnchorNow()
+{
+    const HWND hwnd = g_subclassed;
+    if (hwnd == nullptr)
+        return;
+    long want_x{};
+    if (!GetAnchorX(hwnd, &want_x))
+        return;
+
+    const HWND parent = ::GetAncestor(hwnd, GA_PARENT);
+    RECT rc{};
+    if (!::GetWindowRect(hwnd, &rc))
+        return;
+    //MapWindowPoints 要的是连续的 POINT 数组，左上/右下一起换算到父窗口坐标
+    POINT corners[2]{ { rc.left, rc.top }, { rc.right, rc.bottom } };
+    if (::MapWindowPoints(nullptr, parent, corners, 2) == 0)
+        return;
+    //1 像素以内的误差不折腾（DPI 换算本来就可能有 1px 的取整差）
+    const long delta = corners[0].x > want_x ? corners[0].x - want_x : want_x - corners[0].x;
+    if (delta <= 1)
+        return;
+    ::SetWindowPos(hwnd, nullptr, want_x, corners[0].y, 0, 0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 //把这次移动交给下一个窗口过程
@@ -213,12 +283,14 @@ static void PublishDiag(HWND taskbar_wnd, const wchar_t* reason)
     wchar_t text[256]{};
     const bool attached = (g_subclassed != nullptr);
     if (reason != nullptr)
-        ::swprintf_s(text, L"sub=off reason=%s active=%d block=%d",
-            reason, g_split_active.load() ? 1 : 0, g_block_100.load());
+        ::swprintf_s(text, L"sub=off reason=%s api=%d active=%d block=%d",
+            reason, g_api_version, g_split_active.load() ? 1 : 0, g_block_100.load());
     else
-        ::swprintf_s(text, L"sub=%s mode=%s wnd=0x%llX par=%s active=%d block=%d x=%ld->%ld",
+        ::swprintf_s(text, L"sub=%s mode=%s find=%s api=%d wnd=0x%llX par=%s active=%d block=%d x=%ld->%ld",
             attached ? L"on" : L"off",
             attached ? (g_manual_mode ? L"manual" : L"subclass") : L"none",
+            g_found_by,
+            g_api_version,
             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(taskbar_wnd)),
             g_parent_is_primary_tray ? L"tray" : L"other",
             g_split_active.load() ? 1 : 0, g_block_100.load(),
@@ -230,23 +302,35 @@ void CTaskbarWndAnchor::Sync()
 {
     if (g_app == nullptr)
     {
+        g_found_by = L"none";
         if (g_diag_dirty.exchange(false))
             PublishDiag(nullptr, L"no-app");
         return;
     }
-    //取任务栏窗口句柄是接口 v1 才加的（它是 ITrafficMonitor 最后两个虚函数之一），
-    //老宿主上直接调会踩到虚表末尾之外，所以先问版本。
-    if (g_app->GetAPIVersion() < 1)
+
+    g_api_version = g_app->GetAPIVersion();
+    g_found_by = L"none";
+    HWND taskbar_wnd = nullptr;
+
+    //接口 v1 的宿主（我们自己编的 TM）直接问它要句柄，这是最准的一路
+    if (g_api_version >= 1)
     {
-        AnchorDetach();
-        if (g_diag_dirty.exchange(false))
-            PublishDiag(nullptr, L"api-too-old");
-        return;
+        HWND from_api = static_cast<HWND>(g_app->GetTaskbarWindowHwnd());
+        if (::IsWindow(from_api))
+        {
+            taskbar_wnd = from_api;
+            g_found_by = L"api";
+        }
     }
 
-    HWND taskbar_wnd = static_cast<HWND>(g_app->GetTaskbarWindowHwnd());
-    if (!::IsWindow(taskbar_wnd))
-        taskbar_wnd = nullptr;
+    //官方发布版的 ITrafficMonitor 还报 v0（没有 GetTaskbarWindowHwnd 这个虚函数，
+    //在它的虚表之外，绝不能调），就按窗口标题在本进程里自己找
+    if (taskbar_wnd == nullptr)
+    {
+        taskbar_wnd = FindOwnTaskbarWnd();
+        if (taskbar_wnd != nullptr)
+            g_found_by = L"title";
+    }
 
     //任务栏窗口关掉又打开、或者从主窗口模式换过来，句柄会变；跟着挪一次子类化
     if (taskbar_wnd != g_subclassed)
@@ -255,7 +339,12 @@ void CTaskbarWndAnchor::Sync()
             AnchorAttach(taskbar_wnd);
         else
             AnchorDetach();
+        //挂没挂上、走哪一路拿到的句柄，都变了，把这一行诊断重新发一次
+        g_diag_dirty.store(true);
     }
+
+    //挂上之后每次同步都核对一遍当前 X：块宽变了而主程序没重摆时，由这里补上
+    ApplyAnchorNow();
 
     if (g_diag_dirty.exchange(false))
         PublishDiag(taskbar_wnd, taskbar_wnd == nullptr ? L"no-taskbar-wnd" : nullptr);

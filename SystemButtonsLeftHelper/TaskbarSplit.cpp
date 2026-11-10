@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-09 17:22:36 +08:00
+// Last Modified At: 2026-11-10 10:55:00 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -60,6 +60,18 @@ static std::atomic<long> g_arrange_call_count{ 0 };
 static std::atomic<double> g_button_right_edge_dip[4]{ 0.0, 0.0, 0.0, 0.0 };
 static thread_local bool g_in_hook{ false };
 
+//explorer 不重启的话，磁盘上换了新 dll，进程里可能还是旧镜像（旧代码在跑、新文件在盘上）。
+//这样注册表里那个块宽到底是"新算法算错了"还是"根本没跑到新代码"，看一眼就分得清。
+static void WriteBuildStamp()
+{
+    char stamp[64]{};
+    sprintf_s(stamp, "build=%s %s", __DATE__, __TIME__);
+    wchar_t wide[64]{};
+    if (::MultiByteToWideChar(CP_UTF8, 0, stamp, -1, wide, 64) <= 0)
+        return;
+    SplitRegWriteStringIfChanged(kRegBuild, wide);
+}
+
 //第一次真的看到任务栏按钮经过挂钩，说明“钉住”这件事在当前的 explorer 里成立了，
 //这一刻才把 active/pid 报出去（装配完成的当场还不能确定，因为要等一次真正的排版）。
 //注册表监视是双向的，所以这里用“变了才写”的接口，避免自己叫醒自己空转。
@@ -70,6 +82,7 @@ static void ReportWorkingOnce()
     SplitRegWriteDwordIfChanged(kRegActive, 1u);
     SplitRegWriteDwordIfChanged(kRegPid, ::GetCurrentProcessId());
     SplitRegWriteDwordIfChanged(kRegStep, kStepPinning);
+    WriteBuildStamp();
 }
 
 //被我们动过边距的按钮，禁用时要一个个还原回去（用弱引用，元素被回收就自动失效）
@@ -257,9 +270,13 @@ static void CollectPinnedChildren(FrameworkElement const& root, std::vector<Pinn
 }
 
 //排在 target 前面的那几个按钮一共多宽（顺序按 Windows 自己的排法：开始、搜索、多任务视图）
-static double ComputeClusterOffset(FrameworkElement const& frame, SystemButton target, bool vertical)
+//children_out 带上时，把这次看到的按钮一并交出去：块宽要判断"这一组里还有谁"，
+//同一轮排版里已经走过的树不该再走第二遍（Arrange 的调用非常频繁）。
+static double ComputeClusterOffset(FrameworkElement const& frame, SystemButton target, bool vertical,
+    std::vector<PinnedChild>* children_out = nullptr)
 {
-    std::vector<PinnedChild> children;
+    std::vector<PinnedChild> local;
+    std::vector<PinnedChild>& children = (children_out != nullptr) ? *children_out : local;
     CollectPinnedChildren(frame, children, 0);
     double offset = 0.0;
     int target_rank = static_cast<int>(target);
@@ -409,6 +426,78 @@ static void PublishBlockWidth(double width_dip)
     g_last_published_dip = width_dip;
     DWORD block = static_cast<DWORD>(std::lround(width_dip * 100.0));
     SplitRegWriteDword(kRegBlock, block);
+
+    //四个按钮各自报上来的右边沿，一行写清楚。为什么要这一行：块宽只有一个数，
+    //"谁没报上来"和"谁报大了"看着一样（TM 窗口要么空一条要么压住按钮），
+    //有了四格现场值就能一次分清，省掉一轮编译。
+    wchar_t edges[128]{};
+    ::swprintf_s(edges, L"s=%d search=%d tv=%d w=%d pub=%d",
+        static_cast<int>(std::lround(g_button_right_edge_dip[0].load() * 100.0)),
+        static_cast<int>(std::lround(g_button_right_edge_dip[1].load() * 100.0)),
+        static_cast<int>(std::lround(g_button_right_edge_dip[2].load() * 100.0)),
+        static_cast<int>(std::lround(g_button_right_edge_dip[3].load() * 100.0)),
+        static_cast<int>(block));
+    SplitRegWriteStringIfChanged(kRegEdges, edges);
+}
+
+//这一轮排版实际排了哪几个按钮，不在树上的那一格必须清零。
+//关键：小组件按钮在 Windows 设置里关掉以后，它是从树上整个消失的，
+//再也不会走到我们的 Arrange —— 等它自己说"我不在了"永远等不到，
+//块宽就一直挂着它的旧值（实测关掉小组件后仍是 348，而真实右边界只有 132），
+//TM 的窗口就会在左侧按钮后面空出一大条。
+//所以在别的按钮排版时顺手看一眼这组里还有谁。一个按钮都没找到时什么都不清：
+//那种时候多半是树还没建好或容器是空的，清错了块宽掉到 0，TM 会一头撞进开始按钮。
+//返回"真的抹掉了某一格"，调用方据此重新发布块宽——抹完不发就等于白抹。
+//children 由调用方从同一轮排版里拿到的那份交进来：Arrange 调用非常频繁，
+//同一棵树不该为了算块宽再走第二遍。
+static bool ForgetAbsentButtons(std::vector<PinnedChild> const& children)
+{
+    if (children.empty())
+        return false;
+
+    bool present[4]{ false, false, false, false };
+    for (auto& child : children)
+    {
+        const int index = static_cast<int>(child.button);
+        if (index >= 0 && index < 4)
+            present[index] = true;
+    }
+    //拿“开始按钮在场 + 至少两个按钮”当作“这个容器就是那一组钉住的按钮”的凭据。
+    //万一带上来的容器只是半个组（比如小组件挂在另一个容器里），它看不见别的按钮就会把
+    //别人那一格抹掉，块宽反而变小、TM 就压住按钮了 —— 认不准就不清，宁可维持上一次的值。
+    if (!present[static_cast<int>(SystemButton::Start)] || children.size() < 2)
+        return false;
+
+    bool changed = false;
+    for (int i = 0; i < 4; i++)
+    {
+        if (!present[i] && g_button_right_edge_dip[i].load() != 0.0)
+        {
+            g_button_right_edge_dip[i] = 0.0;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static double MaxBlockEnd()
+{
+    double block = 0.0;
+    for (int i = 0; i < 4; i++)
+    {
+        const double edge = g_button_right_edge_dip[i].load();
+        if (edge > block)
+            block = edge;
+    }
+    return block;
+}
+
+//四格现值 -> 块宽 -> 写注册表（PublishBlockWidth 内部自己判断够不够变化）
+static void PublishBlockFromSlots()
+{
+    const double block = MaxBlockEnd();
+    g_block_width_dip = block;
+    PublishBlockWidth(block);
 }
 
 //某个按钮报上自己的右边沿（DIP）：把它那一格记下来，块宽取四格里最大的那格。
@@ -424,16 +513,7 @@ static void UpdateBlockEnd(SystemButton button, double right_edge_dip)
     if (std::abs(right_edge_dip - g_button_right_edge_dip[index].load()) < 0.05)
         return;         //这一格没变，不用重算也不用写注册表
     g_button_right_edge_dip[index] = right_edge_dip;
-
-    double block = 0.0;
-    for (int i = 0; i < 4; i++)
-    {
-        const double edge = g_button_right_edge_dip[i].load();
-        if (edge > block)
-            block = edge;
-    }
-    g_block_width_dip = block;
-    PublishBlockWidth(block);
+    PublishBlockFromSlots();
 }
 
 //某个按钮不见了（比如小组件被关掉）：清掉那一格，块宽才能跟着缩回去
@@ -443,15 +523,7 @@ static void ClearBlockEnd(SystemButton button)
     if (index < 0 || index >= 4 || g_button_right_edge_dip[index].load() == 0.0)
         return;
     g_button_right_edge_dip[index] = 0.0;
-    double block = 0.0;
-    for (int i = 0; i < 4; i++)
-    {
-        const double edge = g_button_right_edge_dip[i].load();
-        if (edge > block)
-            block = edge;
-    }
-    g_block_width_dip = block;
-    PublishBlockWidth(block);
+    PublishBlockFromSlots();
 }
 
 //Arrange 挂钩：排版器每次给按钮定位都会走到这里
@@ -489,7 +561,17 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
             //估出来的值会跟着天气文字的显示/隐藏上下飘，而且旧写法只增不减，
             //结果注册表里长期挂着一个比实际大 60 多 DIP 的数，TM 的窗口就一会儿空一条、一会儿压住小组件。
             if (enabled)
+            {
+                auto frame = xaml_media::VisualTreeHelper::GetParent(element).try_as<FrameworkElement>();
+                if (frame)
+                {
+                    std::vector<PinnedChild> children;
+                    CollectPinnedChildren(frame, children, 0);
+                    if (ForgetAbsentButtons(children))
+                        PublishBlockFromSlots();
+                }
                 UpdateBlockEnd(SystemButton::Widgets, rect.X + rect.Width);
+            }
             else
                 ClearBlockEnd(SystemButton::Widgets);
             return g_arrange_original(p_this, rect);
@@ -515,7 +597,12 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
             return g_arrange_original(p_this, rect);
 
         bool vertical = IsVerticalTaskbar(frame);
-        double offset = ComputeClusterOffset(frame, button, vertical);
+        //算偏移用的那份"这一组里有谁"，顺手交给块宽记账：这一轮树上没有的按钮，
+        //它那一格必须抹掉（小组件关掉后它再也不会来报），不然块宽永远缩不回去
+        std::vector<PinnedChild> children;
+        double offset = ComputeClusterOffset(frame, button, vertical, &children);
+        if (ForgetAbsentButtons(children))
+            PublishBlockFromSlots();
 
         Rect new_rect = rect;
         //把按钮摆到“前面几个按钮排完之后”的位置；块宽就记这个矩形自己的右边沿

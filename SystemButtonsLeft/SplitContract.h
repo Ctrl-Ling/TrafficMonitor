@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-09 17:55:13 +08:00
+// Last Modified At: 2026-11-10 10:55:00 +08:00
 #pragma once
 #include <windows.h>
 
@@ -20,8 +20,8 @@ static constexpr const wchar_t* kRegEnabled = L"TaskbarSplitEnabled";   //REG_DW
 static constexpr const wchar_t* kRegOwnerPid = L"TaskbarSplitOwner";    //REG_DWORD 插件宿主（TrafficMonitor）的进程ID，宿主退出时助手自行复原
 static constexpr const wchar_t* kRegAckEvent = L"TaskbarSplitAckEvent"; //REG_SZ 助手完成安装/复原后置事件的名字，插件等它，不轮询
 static constexpr const wchar_t* kRegReqSeq = L"TaskbarSplitReqSeq";     //REG_DWORD 请求序号：插件每次改动开关就 +1
-static constexpr const wchar_t* kRegWnd = L"TaskbarSplitWnd";           //REG_SZ 插件自己写（助手不读）：窗口跟随诊断，sub=on mode=subclass|manual wnd=0x... par=tray|other active=... block=... x=旧->新，或 sub=off reason=no-app|api-too-old|no-taskbar-wnd。
-                                                                        //TM 任务栏窗口靠插件给它挂子类过程来紧跟左侧按钮块，这一行说明那次改写有没有真的发生
+static constexpr const wchar_t* kRegWnd = L"TaskbarSplitWnd";           //REG_SZ 插件自己写（助手不读）：窗口跟随诊断，sub=on mode=subclass|manual find=api|title api=%d wnd=0x... par=tray|other active=... block=... x=旧->新，
+                                                                        //或 sub=off reason=no-app|no-taskbar-wnd。TM 任务栏窗口靠插件给它挂子类过程来紧跟左侧按钮块，这一行说明那次改写有没有真的发生、句柄是哪一路拿到的
 
 // 助手 -> 插件、主程序
 static constexpr const wchar_t* kRegAckSeq = L"TaskbarSplitAckSeq";     //REG_DWORD 助手已经处理完的请求序号（等于 kRegReqSeq 表示这一轮做完了）
@@ -29,6 +29,10 @@ static constexpr const wchar_t* kRegActive = L"TaskbarSplitActive";     //REG_DW
 static constexpr const wchar_t* kRegPid = L"TaskbarSplitPid";           //REG_DWORD 助手所在进程（explorer）的ID
 static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的右边界，单位 1/100 DIP（= 最右边那个按钮排版矩形的 X+Width，TM 任务栏窗口就紧跟在这条线后面）
 static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ 调试信息：助手在任务栏上看到的控件类型名
+static constexpr const wchar_t* kRegEdges = L"TaskbarSplitEdges";       //REG_SZ 助手报的现场四格：s=/search=/tv=/w= 每个按钮排版矩形的右边界(1/100 DIP)，pub=最终块宽。
+                                                                        //块宽只有一个数，"某个按钮没报上来"和"某个按钮报大了"看着一样，靠这四格一次分清
+static constexpr const wchar_t* kRegBuild = L"TaskbarSplitBuild";       //REG_SZ 助手 DLL 的编译时间戳。
+                                                                        //explorer 里可能还挂着上一版的镜像（文件换了、进程没换），看这一行就知道正在跑的到底是哪一版
 static constexpr const wchar_t* kRegStep = L"TaskbarSplitStep";         //REG_DWORD 助手走到哪一步了（见下面的 kStep*），插件选项对话框直接显示这句话
 static constexpr const wchar_t* kRegPrologue = L"TaskbarSplitPrologue"; //REG_SZ 挂钩现场字节：S:=虚表槽地址（函数入口）开头24字节 A:=真正下补丁地址开头24字节（reg query 就能看到）
 static constexpr const wchar_t* kRegTarget = L"TaskbarSplitTarget";     //REG_SZ S:=槽地址 T:=函数入口 A:=补丁地址（T+3 说明入口是 endbr64 没被盖）M:=模块基址，S-M 就是该函数的 RVA
