@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-10 10:55:00 +08:00
+// Last Modified At: 2026-11-10 16:53:30 +08:00
 #include "framework.h"
 #include <commctrl.h>
 #include <atomic>
@@ -94,40 +94,41 @@ static bool GetAnchorX(HWND hwnd, long* out_x)
 }
 
 //宿主观测不到任务栏窗口句柄时（官方发布版的 ITrafficMonitor 还是 v0，没有 GetTaskbarWindowHwnd），
-//按窗口标题在本进程的窗口里自己找。
-//限定“进程号 = 自己”：别的程序就算抄了这个标题也找不到我们头上；
-//再优先挑父窗口是主屏 Shell_TrayWnd 的那个，副屏任务栏窗口（父窗口是 Shell_SecondaryTrayWnd）不会被选中。
-struct TaskbarWndSearch
+//按窗口标题自己找。顺序很关键：TM 嵌进任务栏以后，这个窗口是 Shell_TrayWnd 的**子窗口**，
+//而 EnumWindows 只走顶层窗口，根本看不见它（实测 reason=no-taskbar-wnd 就是这么来的）。
+//所以先按子窗口找：FindWindowEx 限定在 Shell_TrayWnd 下面，副屏那个挂在 Shell_SecondaryTrayWnd 下，
+//天然被排除；嵌入失败时它是顶层窗口，再用 FindWindow 兜底。
+//两路都核对进程号是自己，别的程序就算抄了这个标题也找不到我们头上。
+static bool IsOwnWindow(HWND hwnd)
 {
-    HWND tray;
-    HWND strict;      //父窗口就是主屏任务栏的
-    HWND loose;       //同标题、同进程的任意一个（嵌入失败或还没挂上去时的备胎）
-};
-
-static BOOL CALLBACK EnumTaskbarWndProc(HWND hwnd, LPARAM l_param)
-{
-    auto* search = reinterpret_cast<TaskbarWndSearch*>(l_param);
     DWORD pid = 0;
-    if (::GetWindowThreadProcessId(hwnd, &pid) == 0 || pid != ::GetCurrentProcessId())
-        return TRUE;
-    wchar_t text[64]{};
-    if (::GetWindowTextW(hwnd, text, 64) <= 0)
-        return TRUE;
-    if (::lstrcmpiW(text, kTaskbarWndTitle) != 0)
-        return TRUE;
-    if (search->loose == nullptr)
-        search->loose = hwnd;
-    if (::GetAncestor(hwnd, GA_PARENT) == search->tray)
-        search->strict = hwnd;
-    return TRUE;
+    return ::GetWindowThreadProcessId(hwnd, &pid) != 0 && pid == ::GetCurrentProcessId();
 }
 
-static HWND FindOwnTaskbarWnd()
+static HWND FindOwnTaskbarWnd(const wchar_t** out_found_by)
 {
-    TaskbarWndSearch search{};
-    search.tray = ::FindWindowW(L"Shell_TrayWnd", nullptr);
-    ::EnumWindows(&EnumTaskbarWndProc, reinterpret_cast<LPARAM>(&search));
-    return search.strict != nullptr ? search.strict : search.loose;
+    const HWND tray = ::FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (tray != nullptr)
+    {
+        //类名给 NULL = 什么类都匹配，只按标题在子窗口里找
+        HWND child = ::FindWindowExW(tray, nullptr, nullptr, kTaskbarWndTitle);
+        if (child != nullptr && IsOwnWindow(child))
+        {
+            if (out_found_by != nullptr)
+                *out_found_by = L"child";
+            return child;
+        }
+    }
+    HWND top = ::FindWindowW(nullptr, kTaskbarWndTitle);
+    if (top != nullptr && IsOwnWindow(top))
+    {
+        if (out_found_by != nullptr)
+            *out_found_by = L"top";      //没嵌进任务栏，坐标是屏幕绝对值，这里不该插手
+        return top;
+    }
+    if (out_found_by != nullptr)
+        *out_found_by = L"none";
+    return nullptr;
 }
 
 //块宽变了、但主程序这一次没有重新摆窗口（它只在通知区宽度/开始按钮位置变了才摆），
@@ -286,16 +287,18 @@ static void PublishDiag(HWND taskbar_wnd, const wchar_t* reason)
         ::swprintf_s(text, L"sub=off reason=%s api=%d active=%d block=%d",
             reason, g_api_version, g_split_active.load() ? 1 : 0, g_block_100.load());
     else
-        ::swprintf_s(text, L"sub=%s mode=%s find=%s api=%d wnd=0x%llX par=%s active=%d block=%d x=%ld->%ld",
+        ::swprintf_s(text, L"sub=%s find=%s m=%s block=%d x=%ld->%ld",
             attached ? L"on" : L"off",
-            attached ? (g_manual_mode ? L"manual" : L"subclass") : L"none",
             g_found_by,
-            g_api_version,
-            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(taskbar_wnd)),
-            g_parent_is_primary_tray ? L"tray" : L"other",
-            g_split_active.load() ? 1 : 0, g_block_100.load(),
+            attached ? (g_manual_mode ? L"manual" : L"sub") : L"none",
+            g_block_100.load(),
             g_last_x_before, g_last_x_after);
     SplitRegWriteStringIfChanged(kRegWnd, text);
+    //句柄值本身没有可读性，出问题时用 reg query 看注册表更快，所以不放进这一行：
+    //选项里那行静态文本只有约 55 个字符的宽度，长了会被截断（实测就是这样丢了后半句）。
+    //find 已经把"父窗口对不对"说清楚了：child = 就在主屏 Shell_TrayWnd 底下；
+    //top = 没嵌进任务栏，GetAnchorX 会自己拒绝改写，表现就是 x=0->0。
+    (void)taskbar_wnd;
 }
 
 void CTaskbarWndAnchor::Sync()
@@ -324,13 +327,9 @@ void CTaskbarWndAnchor::Sync()
     }
 
     //官方发布版的 ITrafficMonitor 还报 v0（没有 GetTaskbarWindowHwnd 这个虚函数，
-    //在它的虚表之外，绝不能调），就按窗口标题在本进程里自己找
+    //在它的虚表之外，绝不能调），就按窗口标题自己找
     if (taskbar_wnd == nullptr)
-    {
-        taskbar_wnd = FindOwnTaskbarWnd();
-        if (taskbar_wnd != nullptr)
-            g_found_by = L"title";
-    }
+        taskbar_wnd = FindOwnTaskbarWnd(&g_found_by);
 
     //任务栏窗口关掉又打开、或者从主窗口模式换过来，句柄会变；跟着挪一次子类化
     if (taskbar_wnd != g_subclassed)

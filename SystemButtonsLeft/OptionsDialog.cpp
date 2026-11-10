@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-10 10:55:00 +08:00
+// Last Modified At: 2026-11-10 16:53:30 +08:00
 #include "framework.h"
 #include <cstdio>
 #include <cwchar>
@@ -87,29 +87,26 @@ static void RefreshStatusLines(HWND hDlg)
     const wchar_t* result = CTaskbarSplitController::Instance().LastMessage().c_str();
     SetStatusLine(hDlg, IDC_STATUS_LINE5, result);
 
-    //诊断这一行同时说三件事：explorer 里的助手卡在哪一步、助手报上来的四格现场值、
-    //以及插件这边有没有真的把 TM 的任务栏窗口搬到按钮块后面（后两者都在 dll 里做，主程序代码不用改）。
-    wchar_t base[384]{};
-    ::swprintf_s(base, L"诊断（%d）：%s", st.helper_step, HelperStepText(st.helper_step));
-    wchar_t diag[640]{};
-    wchar_t edges[128]{};
-    if (SplitRegReadString(kRegEdges, edges, sizeof(edges) / sizeof(edges[0])) && edges[0] != L'\0')
-        ::swprintf_s(diag, L"%s｜按钮四格：%s", base, edges);
-    else
-        ::wcscpy_s(diag, base);
+    //诊断分三行，一行一件事（每行只有约 55 个字符的宽度，拼一起就被截断了，实测就是这样丢了后半句）：
+    //  第 6 行：explorer 里的助手卡在哪一步；
+    //  第 7 行：插件这边有没有真的把 TM 的任务栏窗口搬到按钮块后面；
+    //  第 8 行：助手看到的四个按钮各自的右边界（块宽取其中最大的一个）。
+    ::swprintf_s(buf, L"诊断（%d）：%s", st.helper_step, HelperStepText(st.helper_step));
+    SetStatusLine(hDlg, IDC_STATUS_LINE6, buf);
 
-    wchar_t line[896]{};
     wchar_t anchor[256]{};
     if (SplitRegReadString(kRegWnd, anchor, sizeof(anchor) / sizeof(anchor[0])) && anchor[0] != L'\0')
-    {
-        ::swprintf_s(line, L"%s｜窗口跟随：%s", diag, anchor);
-        SetStatusLine(hDlg, IDC_STATUS_LINE6, line);
-    }
+        ::swprintf_s(buf, L"窗口跟随：%s", anchor);
     else
-    {
-        ::swprintf_s(line, L"%s｜窗口跟随：还没挂上（任务栏窗口打开后本体下一次刷新就挂）", diag);
-        SetStatusLine(hDlg, IDC_STATUS_LINE6, line);
-    }
+        ::swprintf_s(buf, L"窗口跟随：还没挂上（任务栏窗口打开后本体下一次刷新就挂）");
+    SetStatusLine(hDlg, IDC_STATUS_LINE7, buf);
+
+    wchar_t edges[128]{};
+    if (SplitRegReadString(kRegEdges, edges, sizeof(edges) / sizeof(edges[0])) && edges[0] != L'\0')
+        ::swprintf_s(buf, L"按钮右边界：%s", edges);
+    else
+        ::swprintf_s(buf, L"按钮右边界：助手还没报上来");
+    SetStatusLine(hDlg, IDC_STATUS_LINE8, buf);
 }
 
 static INT_PTR CALLBACK DlgProc(HWND hDlg, UINT message, WPARAM w_param, LPARAM l_param)

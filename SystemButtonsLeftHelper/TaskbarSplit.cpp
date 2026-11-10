@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-10 10:55:00 +08:00
+// Last Modified At: 2026-11-10 16:53:30 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -10,6 +10,7 @@
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Automation.h>
+#include <winrt/Windows.UI.Xaml.Automation.Peers.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.Shapes.h>
@@ -22,6 +23,7 @@ using namespace winrt;
 using namespace Windows::Foundation;
 using namespace Windows::UI::Xaml;
 namespace xaml_automation = Windows::UI::Xaml::Automation;
+namespace xaml_peers = Windows::UI::Xaml::Automation::Peers;
 namespace xaml_media = Windows::UI::Xaml::Media;
 namespace xaml_shapes = Windows::UI::Xaml::Shapes;
 
@@ -58,6 +60,9 @@ static std::atomic<long> g_arrange_call_count{ 0 };
 //左侧按钮块里每个按钮“右边沿到哪儿了”（DIP），下标 = (int)SystemButton。
 //块宽不是算出来的，是这四个按钮各自报上来的右边沿里最大的那个。
 static std::atomic<double> g_button_right_edge_dip[4]{ 0.0, 0.0, 0.0, 0.0 };
+//块宽到底是按“看得见的边界”算的还是退回排版矩形算的，写进诊断：
+//这两种数差着一两个按钮位，光看数字分不清是算法错了还是这个系统上拿不到 peer。
+static std::atomic<bool> g_edge_from_uia{ false };
 static thread_local bool g_in_hook{ false };
 
 //explorer 不重启的话，磁盘上换了新 dll，进程里可能还是旧镜像（旧代码在跑、新文件在盘上）。
@@ -165,6 +170,7 @@ void RestoreMarginsAsync()
     for (auto& edge : g_button_right_edge_dip)
         edge = 0.0;
     g_last_published_dip = -1.0;
+    g_edge_from_uia = false;
     SplitRegWriteDwordIfChanged(kRegBlock, 0u);
 }
 
@@ -418,6 +424,58 @@ static void PostToTaskbarThread(FrameworkElement const& element, void(*func)(Fra
     }
 }
 
+//眼睛看到的右边界，以 UIA 的 BoundingRectangle 为准 —— 那才是屏幕上真正占位的那一块。
+//为什么不能继续用排版矩形（X+Width）：实测四格里只有开始按钮对得上，其余全都偏：
+//  搜索那个元素排出来宽是 0（报 44.80，可见图标在 44~88）；
+//  多任务视图报 88.80，可见按钮其实在 88~132；
+//  小组件按钮的矩形比天气图标宽出一大截（报 348.80，可见右边界只有 184）。
+//也就是说排版矩形和可见内容是两套坐标，拿它当块宽，TM 一会儿压住按钮、一会儿空一大条。
+//拿不到 peer、或算出个离谱的数，就退回排版矩形（保持原来的行为，不会更糟）。
+//out_visible=false 表示这个按钮现在根本不占位：小组件在设置里关掉后元素还挂在树上，
+//但已经折叠了，它自己再也不会来报"我不在了"，只能靠这个判断把它那一格抹掉。
+static double VisibleRightEdgeDip(FrameworkElement const& element, double fallback_edge_dip,
+    bool* out_visible)
+{
+    if (out_visible != nullptr)
+        *out_visible = true;
+    try
+    {
+        auto peer = xaml_peers::FrameworkElementAutomationPeer::CreatePeerForElement(element);
+        if (!peer)
+            return fallback_edge_dip;
+
+        //BoundingRectangle 是屏幕物理像素；宽或高为 0 = 这个按钮现在看不见
+        Rect bounds = peer.GetBoundingRectangle();
+        if (!std::isfinite(bounds.Width) || !std::isfinite(bounds.Height) ||
+            bounds.Width <= 0.0 || bounds.Height <= 0.0)
+        {
+            if (out_visible != nullptr)
+                *out_visible = false;
+            return 0.0;
+        }
+
+        const HWND tray = ::FindWindowW(L"Shell_TrayWnd", nullptr);
+        RECT tray_rc{};
+        UINT dpi = 96;
+        if (tray == nullptr || !::GetWindowRect(tray, &tray_rc))
+            return fallback_edge_dip;
+        dpi = ::GetDpiForWindow(tray);
+        if (dpi < 96)
+            dpi = 96;
+
+        const double edge = (static_cast<double>(bounds.X) + bounds.Width - tray_rc.left) * 96.0 / dpi;
+        //任务栏再宽也不会到十万 DIP，越界说明这个版本的 peer 给的坐标不是这个意思
+        if (!std::isfinite(edge) || edge <= 0.0 || edge > 100000.0)
+            return fallback_edge_dip;
+        g_edge_from_uia.store(true);
+        return edge;
+    }
+    catch (...)
+    {
+        return fallback_edge_dip;
+    }
+}
+
 static void PublishBlockWidth(double width_dip)
 {
     //宽度基本没变就不写注册表（每写一次就是一次跨进程通知）
@@ -429,14 +487,15 @@ static void PublishBlockWidth(double width_dip)
 
     //四个按钮各自报上来的右边沿，一行写清楚。为什么要这一行：块宽只有一个数，
     //"谁没报上来"和"谁报大了"看着一样（TM 窗口要么空一条要么压住按钮），
-    //有了四格现场值就能一次分清，省掉一轮编译。
+    //有了四格现场值就能一次分清，省掉一轮编译。src 说明这些数是"看得见的边界"还是退回了排版矩形。
     wchar_t edges[128]{};
-    ::swprintf_s(edges, L"s=%d search=%d tv=%d w=%d pub=%d",
+    ::swprintf_s(edges, L"s=%d search=%d tv=%d w=%d pub=%d src=%s",
         static_cast<int>(std::lround(g_button_right_edge_dip[0].load() * 100.0)),
         static_cast<int>(std::lround(g_button_right_edge_dip[1].load() * 100.0)),
         static_cast<int>(std::lround(g_button_right_edge_dip[2].load() * 100.0)),
         static_cast<int>(std::lround(g_button_right_edge_dip[3].load() * 100.0)),
-        static_cast<int>(block));
+        static_cast<int>(block),
+        g_edge_from_uia.load() ? L"uia" : L"rect");
     SplitRegWriteStringIfChanged(kRegEdges, edges);
 }
 
@@ -500,10 +559,10 @@ static void PublishBlockFromSlots()
     PublishBlockWidth(block);
 }
 
-//某个按钮报上自己的右边沿（DIP）：把它那一格记下来，块宽取四格里最大的那格。
-//为什么用 Arrange 矩形自己的 X+Width：排版器把按钮放到这个矩形里，最终就是这个矩形说了算；
-//以前是拿 ComputeClusterOffset + GetButtonExtent 另算一套（DesiredSize 会跟着天气文字、悬停宽度上下飘），
-//而且只会变大不会变小 —— 实测注册表里长期挂着 348，而小组件真实右边沿只有 285，
+//某个按钮报上自己“看得见”的右边沿（DIP）：把它那一格记下来，块宽取四格里最大的那格。
+//数的来源见上面 VisibleRightEdgeDip 的说明（UIA 边界为准，排版矩形只当兜底）；
+//更早的版本是拿 ComputeClusterOffset + GetButtonExtent 另算一套（DesiredSize 会跟着天气文字、
+//悬停宽度上下飘），而且只会变大不会变小 —— 实测注册表里长期挂着 348，而小组件真实右边沿只有 184，
 //TM 把窗口钉在这个数后面就一会儿空一条、一会儿压住小组件。
 static void UpdateBlockEnd(SystemButton button, double right_edge_dip)
 {
@@ -557,9 +616,8 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
             if (WidgetsPositionNeedsUpdate(element, enabled))
                 PostToTaskbarThread(element, UpdateWidgetsPosition, enabled);
             //小组件是这一组里最右边的一个，块宽基本就是它的右边沿。
-            //这里直接用排版器给它的矩形（X+Width），不再自己按 DesiredSize 估：
-            //估出来的值会跟着天气文字的显示/隐藏上下飘，而且旧写法只增不减，
-            //结果注册表里长期挂着一个比实际大 60 多 DIP 的数，TM 的窗口就一会儿空一条、一会儿压住小组件。
+            //数从 UIA 的可见边界拿（拿不到才退回排版矩形）：这个按钮的排版矩形比天气图标宽出一大截，
+            //照着矩形报，TM 的窗口就会在小组件后面空出 160 多 DIP。
             if (enabled)
             {
                 auto frame = xaml_media::VisualTreeHelper::GetParent(element).try_as<FrameworkElement>();
@@ -570,7 +628,12 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
                     if (ForgetAbsentButtons(children))
                         PublishBlockFromSlots();
                 }
-                UpdateBlockEnd(SystemButton::Widgets, rect.X + rect.Width);
+                bool visible = true;
+                const double edge = VisibleRightEdgeDip(element, rect.X + rect.Width, &visible);
+                if (visible)
+                    UpdateBlockEnd(SystemButton::Widgets, edge);
+                else
+                    ClearBlockEnd(SystemButton::Widgets);      //小组件被关掉：元素还在树上，但不占位了
             }
             else
                 ClearBlockEnd(SystemButton::Widgets);
@@ -605,17 +668,22 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
             PublishBlockFromSlots();
 
         Rect new_rect = rect;
-        //把按钮摆到“前面几个按钮排完之后”的位置；块宽就记这个矩形自己的右边沿
+        //把按钮摆到“前面几个按钮排完之后”的位置
         if (vertical)
-        {
             new_rect.Y = static_cast<float>(offset);
-            UpdateBlockEnd(button, static_cast<double>(new_rect.X) + new_rect.Width);
-        }
         else
-        {
             new_rect.X = static_cast<float>(offset);
-            UpdateBlockEnd(button, static_cast<double>(new_rect.X) + new_rect.Width);
-        }
+
+        //块宽记的是这个按钮“看得见”的右边沿（排版矩形只当作拿不到 peer 时的兜底）：
+        //实测搜索那一格排出来宽是 0、多任务视图的可见图标比它的排版矩形整整右移一个按钮位，
+        //照着排版矩形报，块宽就永远比屏幕上的按钮窄一截，TM 的窗口会压住按钮。
+        bool visible = true;
+        const double rect_edge = static_cast<double>(new_rect.X) + new_rect.Width;
+        const double edge = VisibleRightEdgeDip(element, rect_edge, &visible);
+        if (visible)
+            UpdateBlockEnd(button, edge);
+        else
+            ClearBlockEnd(button);
 
         return g_arrange_original(p_this, new_rect);
     }
@@ -951,6 +1019,7 @@ void RemoveTaskbarSplit()
     for (auto& edge : g_button_right_edge_dip)
         edge = 0.0;
     g_last_published_dip = -1.0;
+    g_edge_from_uia = false;
     SplitRegWriteDwordIfChanged(kRegStep, kStepNone);
 }
 
