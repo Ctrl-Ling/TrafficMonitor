@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-10 16:53:30 +08:00
+// Last Modified At: 2026-11-10 19:54:31 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -63,6 +63,24 @@ static std::atomic<double> g_button_right_edge_dip[4]{ 0.0, 0.0, 0.0, 0.0 };
 //块宽到底是按“看得见的边界”算的还是退回排版矩形算的，写进诊断：
 //这两种数差着一两个按钮位，光看数字分不清是算法错了还是这个系统上拿不到 peer。
 static std::atomic<bool> g_edge_from_uia{ false };
+//每个按钮累计经过挂钩多少次（下标 = (int)SystemButton）。
+//为什么要这个数：开关小组件后 TM 不动，光看块宽分不清是两种完全不同的毛病——
+//  ①那个按钮根本没走到我们的 Arrange（识别条件在这个系统上不成立 / 它是另一个控件），
+//  ②走到了，但当场量到个空边界（出现动画中间态），于是那一格被抹成 0。
+//两者的修法一处在这个文件的事件订阅、一处在测量口径，所以每个按钮各留一个计数器，一次编译就能分开。
+static std::atomic<long> g_button_arrange_count[4]{ 0, 0, 0, 0 };
+//小组件自己的事件进来了几次（Unloaded / Loaded / SizeChanged 合在一起数）。
+//为什么也要这个数：n= 只在块宽真的变了时才写注册表，"什么都没变"的时候一行都不落，
+//于是分不清"没变化"和"没发生"。ev 每进来一次就 +1，字符串跟着变，
+//注册表必然被重写一次 —— 他一按开关、TaskbarSplitEdges 没动，就是事件压根没来，
+//动了但 n 的最后一位没涨，就是事件来了而按钮始终没走到 Arrange。两种毛病一眼分开。
+static std::atomic<long> g_widgets_event_count{ 0 };
+//小组件按钮的"尺寸/挂载刚变"事件订在哪个实例上：同一个实例只订一次，换了实例（重新创建）就换人。
+//光比 abi 指针不行：旧元素被回收后，新元素完全可能拿到同一个地址，那就漏订了，
+//所以再存一份弱引用 —— 引用失效（旧元素死了）就说明指针相同也不可能是同一个东西，必须重订。
+//只在任务栏线程访问（Arrange 和这些事件都在那里）。
+static void* g_widgets_watched_abi{ nullptr };
+static winrt::weak_ref<FrameworkElement> g_widgets_watched;
 static thread_local bool g_in_hook{ false };
 
 //explorer 不重启的话，磁盘上换了新 dll，进程里可能还是旧镜像（旧代码在跑、新文件在盘上）。
@@ -476,6 +494,31 @@ static double VisibleRightEdgeDip(FrameworkElement const& element, double fallba
     }
 }
 
+//四个按钮各自报上来的右边沿，一行写清楚。为什么要这一行：块宽只有一个数，
+//"谁没报上来"和"谁报大了"看着一样（TM 窗口要么空一条要么压住按钮），
+//有了四格现场值就能一次分清，省掉一轮编译。src 说明这些数是"看得见的边界"还是退回了排版矩形。
+//n= 是这四个按钮各自累计经过挂钩几次（顺序还是 s/se/tv/w）：
+//某一格是 0 就说明它根本没来排版（识别或事件没覆盖到），有次数却报 0 就是量到空边界。
+//ev= 是小组件自己的事件进来了几次：光有 n= 时，"什么都没变"和"根本没发生"看着一样，
+//所以小组件事件每次都顺手强制发一行 —— 他按了开关而这一行没动，就是事件压根没来。
+//pub 不在这里重复了，"助手已挂钩，块宽 …"那一行给的就是同一个数。
+static void PublishEdges()
+{
+    wchar_t edges[128]{};
+    ::swprintf_s(edges, L"s=%d se=%d tv=%d w=%d src=%s n=%d/%d/%d/%d ev=%d",
+        static_cast<int>(std::lround(g_button_right_edge_dip[0].load() * 100.0)),
+        static_cast<int>(std::lround(g_button_right_edge_dip[1].load() * 100.0)),
+        static_cast<int>(std::lround(g_button_right_edge_dip[2].load() * 100.0)),
+        static_cast<int>(std::lround(g_button_right_edge_dip[3].load() * 100.0)),
+        g_edge_from_uia.load() ? L"uia" : L"rect",
+        static_cast<int>(g_button_arrange_count[0].load()),
+        static_cast<int>(g_button_arrange_count[1].load()),
+        static_cast<int>(g_button_arrange_count[2].load()),
+        static_cast<int>(g_button_arrange_count[3].load()),
+        static_cast<int>(g_widgets_event_count.load()));
+    SplitRegWriteStringIfChanged(kRegEdges, edges);
+}
+
 static void PublishBlockWidth(double width_dip)
 {
     //宽度基本没变就不写注册表（每写一次就是一次跨进程通知）
@@ -485,18 +528,7 @@ static void PublishBlockWidth(double width_dip)
     DWORD block = static_cast<DWORD>(std::lround(width_dip * 100.0));
     SplitRegWriteDword(kRegBlock, block);
 
-    //四个按钮各自报上来的右边沿，一行写清楚。为什么要这一行：块宽只有一个数，
-    //"谁没报上来"和"谁报大了"看着一样（TM 窗口要么空一条要么压住按钮），
-    //有了四格现场值就能一次分清，省掉一轮编译。src 说明这些数是"看得见的边界"还是退回了排版矩形。
-    wchar_t edges[128]{};
-    ::swprintf_s(edges, L"s=%d search=%d tv=%d w=%d pub=%d src=%s",
-        static_cast<int>(std::lround(g_button_right_edge_dip[0].load() * 100.0)),
-        static_cast<int>(std::lround(g_button_right_edge_dip[1].load() * 100.0)),
-        static_cast<int>(std::lround(g_button_right_edge_dip[2].load() * 100.0)),
-        static_cast<int>(std::lround(g_button_right_edge_dip[3].load() * 100.0)),
-        static_cast<int>(block),
-        g_edge_from_uia.load() ? L"uia" : L"rect");
-    SplitRegWriteStringIfChanged(kRegEdges, edges);
+    PublishEdges();
 }
 
 //这一轮排版实际排了哪几个按钮，不在树上的那一格必须清零。
@@ -585,6 +617,93 @@ static void ClearBlockEnd(SystemButton button)
     PublishBlockFromSlots();
 }
 
+//小组件那一格重新量一次并记账（它自己的事件进来时走这里）。
+//量不到就什么都不做：绝不能把"这会儿量不到"当成"它不在了"抹掉，
+//抹掉的后果就是他看到的那个 bug —— 小组件明明开了，块宽还停在没开的那个数，TM 压在小组件上。
+static void RepublishWidgetsEdge(FrameworkElement const& element)
+{
+    if (!g_enabled_cache.load())
+        return;
+    bool visible = true;
+    const double edge = VisibleRightEdgeDip(element, 0.0, &visible);
+    if (visible && edge > 0.0)
+        UpdateBlockEnd(SystemButton::Widgets, edge);
+    else if (!element.IsVisible())
+        ClearBlockEnd(SystemButton::Widgets);
+}
+
+//小组件事件的统一处理：记一笔 ev、按类型补账，然后无条件发一行现场。
+//为什么"无条件发"：只有 ev 变了才保证注册表被动一次，这样"我按了开关但什么都没发生"
+//在注册表里是看得见的（那一行不动），而不是只能靠"数字没变"去猜。
+static void OnWidgetsEvent(winrt::weak_ref<FrameworkElement> const& weak, bool unloaded)
+{
+    g_widgets_event_count.fetch_add(1, std::memory_order_relaxed);
+    try
+    {
+        auto element = weak.get();
+        if (!element)
+            return;
+        if (unloaded)
+            ClearBlockEnd(SystemButton::Widgets);       //元素从树上摘掉了，那一格不能留
+        else
+            RepublishWidgetsEdge(element);
+    }
+    catch (...)
+    {
+    }
+    PublishEdges();
+}
+
+//给小组件按钮订一次它自己的事件。为什么非得订：块宽过去只在"有按钮走到 Arrange"时才重新记账，
+//可开关小组件这件事不一定让别的按钮重排一次版——
+//  关掉时：那个元素整个从树上摘掉，再也不会来报"我不在了"，旧边界就一直挂着（TM 空一大条）；
+//  打开时：它刚出现那一下量到的可能是空边界（动画中间态），我们当时把那一格抹成 0（TM 压住小组件）。
+//两种都得等一个外部事件（实测是系统截图）逼任务栏完整排一次版才对得上。
+//这三个事件都是 XAML 自己发的，不用定时器（UWP 的 FrameworkElement 上没有"可见性变化"这个事件，
+//但折叠成 0 宽必然走 SizeChanged，效果一样）：
+//  Unloaded —— 元素被摘掉：那一格必须清零；
+//  Loaded —— 元素又挂回来（重新打开小组件 / 任务栏重建）：先量一次，量不到也还有下面的 SizeChanged；
+//  SizeChanged —— 尺寸刚落定（出现动画走完、天气文字变长变短、被折叠成 0）：重量一次。
+static void WatchWidgetsEvents(FrameworkElement const& element)
+{
+    void* abi = winrt::get_abi(element);
+    if (g_widgets_watched_abi == abi)
+    {
+        try
+        {
+            //指针相同还不够，弱引用必须还能取出同一个对象，才算"订在这一个实例上"
+            if (g_widgets_watched.get())
+                return;                 //同一个实例订过了，别一次排版订一遍
+        }
+        catch (...)
+        {
+        }
+    }
+
+    g_widgets_watched_abi = abi;
+    try
+    {
+        //弱引用：元素被回收就自动失效，不能让它为了听事件而永远活着
+        winrt::weak_ref<FrameworkElement> weak{ element };
+        g_widgets_watched = weak;
+
+        //摘掉（小组件在设置里关掉，这个按钮就从树上消失了）：那一格必须清零
+        element.Unloaded([weak](auto&&, auto&&) { OnWidgetsEvent(weak, true); });
+
+        //挂回来（重新打开小组件、任务栏重建）：出现动画这一步可能还量不到，
+        //但紧接着一定会有 SizeChanged，那里再量一次
+        element.Loaded([weak](auto&&, auto&&) { OnWidgetsEvent(weak, false); });
+
+        //刚落定一次尺寸（出现动画走完、天气文字变长变短、整组折叠成 0）：重量一次
+        element.SizeChanged([weak](auto&&, auto&&) { OnWidgetsEvent(weak, false); });
+    }
+    catch (...)
+    {
+        g_widgets_watched_abi = nullptr;    //没订上（这个元素不支持），下次排版再试
+        g_widgets_watched = nullptr;
+    }
+}
+
 //Arrange 挂钩：排版器每次给按钮定位都会走到这里
 static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
 {
@@ -609,10 +728,18 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
         const bool enabled = g_enabled_cache.load();
         SystemButton button = IdentifySystemButton(element);
 
+        //每一格都记一次"这个按钮走到 Arrange 没有"。诊断里 n=开始/搜索/视图/小组件 就是这四个数：
+        //开关小组件之后 w 没动，先看这里——n 的最后一位没涨 = 它压根没来排版（那就是元素被摘掉，
+        //靠它自己的 Unloaded 事件补账）；涨了但 w 还是旧值 = 来了、量到的是空边界（动画中间态）。
+        if (button != SystemButton::None)
+            g_button_arrange_count[static_cast<int>(button)].fetch_add(1, std::memory_order_relaxed);
+
         if (button == SystemButton::Widgets)
         {
             ReportWorkingOnce();
             RememberTouched(element);
+            //从此以后这一格不再只靠排版轮次：元素自己会报"我变了/我不在了"
+            WatchWidgetsEvents(element);
             if (WidgetsPositionNeedsUpdate(element, enabled))
                 PostToTaskbarThread(element, UpdateWidgetsPosition, enabled);
             //小组件是这一组里最右边的一个，块宽基本就是它的右边沿。
@@ -632,8 +759,11 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
                 const double edge = VisibleRightEdgeDip(element, rect.X + rect.Width, &visible);
                 if (visible)
                     UpdateBlockEnd(SystemButton::Widgets, edge);
-                else
-                    ClearBlockEnd(SystemButton::Widgets);      //小组件被关掉：元素还在树上，但不占位了
+                else if (!element.IsVisible())
+                    ClearBlockEnd(SystemButton::Widgets);      //小组件真的被关掉：元素还在树上，但不占位了
+                //visible==false 但 IsVisible()==true：这是出现动画的中间态（元素说要画、peer 还没给出边界）。
+                //这时候绝不能把那一格抹成 0 —— 抹了就是"小组件开着、块宽却按没开算"，TM 直接压上去。
+                //留着旧值，等它自己的 Loaded / SizeChanged 来重量一遍。
             }
             else
                 ClearBlockEnd(SystemButton::Widgets);

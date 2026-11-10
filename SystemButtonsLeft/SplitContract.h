@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-10 19:10:28 +08:00
+// Last Modified At: 2026-11-10 19:54:31 +08:00
 #pragma once
 #include <windows.h>
 
@@ -31,8 +31,8 @@ static constexpr const wchar_t* kRegActive = L"TaskbarSplitActive";     //REG_DW
 static constexpr const wchar_t* kRegPid = L"TaskbarSplitPid";           //REG_DWORD 助手所在进程（explorer）的ID
 static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的右边界，单位 1/100 DIP（= 最右边那个按钮排版矩形的 X+Width，TM 任务栏窗口就紧跟在这条线后面）
 static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ 调试信息：助手在任务栏上看到的控件类型名
-static constexpr const wchar_t* kRegEdges = L"TaskbarSplitEdges";       //REG_SZ 助手报的现场四格：s=/search=/tv=/w= 每个按钮排版矩形的右边界(1/100 DIP)，pub=最终块宽。
-                                                                        //块宽只有一个数，"某个按钮没报上来"和"某个按钮报大了"看着一样，靠这四格一次分清
+static constexpr const wchar_t* kRegEdges = L"TaskbarSplitEdges";       //REG_SZ 助手报的现场四格：s=/se=/tv=/w= 每个按钮看得见的右边界(1/100 DIP)，src=uia|rect 这些数是 UIA 边界还是退回排版矩形，n=开始/搜索/视图/小组件各自累计经过挂钩几次，ev=小组件按钮自己的事件进来了几次。
+                                                                        //块宽只有一个数，"某个按钮没报上来"和"某个按钮报大了"看着一样，靠这四格一次分清；开关小组件后这一行动不动，分的又是"事件没来"和"来了没量到"。
 static constexpr const wchar_t* kRegBuild = L"TaskbarSplitBuild";       //REG_SZ 助手 DLL 的编译时间戳。
                                                                         //explorer 里可能还挂着上一版的镜像（文件换了、进程没换），看这一行就知道正在跑的到底是哪一版
 static constexpr const wchar_t* kRegStep = L"TaskbarSplitStep";         //REG_DWORD 助手走到哪一步了（见下面的 kStep*），插件选项对话框直接显示这句话
