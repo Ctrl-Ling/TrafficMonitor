@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-10 16:53:30 +08:00
+// Last Modified At: 2026-11-10 19:09:21 +08:00
 #include "framework.h"
 #include <cstdio>
 #include <cwchar>
@@ -89,7 +89,10 @@ static void RefreshStatusLines(HWND hDlg)
 
     //诊断分三行，一行一件事（每行只有约 55 个字符的宽度，拼一起就被截断了，实测就是这样丢了后半句）：
     //  第 6 行：explorer 里的助手卡在哪一步；
-    //  第 7 行：插件这边有没有真的把 TM 的任务栏窗口搬到按钮块后面；
+    //  第 7 行：插件这边有没有真的把 TM 的任务栏窗口搬到按钮块后面。
+    //          其中 sy= 是本体回调（OnMonitorInfo）跑过几次，0 就说明这个宿主根本不通知插件，
+    //          跟手这件事全靠注册表变化叫醒的 ApplyNow；ap= 是插件主动搬窗口的次数，
+    //          x=旧->新 是最后一次搬运的两端（搬之前在哪 / 算出来该在哪）。
     //  第 8 行：助手看到的四个按钮各自的右边界（块宽取其中最大的一个）。
     ::swprintf_s(buf, L"诊断（%d）：%s", st.helper_step, HelperStepText(st.helper_step));
     SetStatusLine(hDlg, IDC_STATUS_LINE6, buf);

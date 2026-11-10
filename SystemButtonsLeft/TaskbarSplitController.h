@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-09 17:39:27 +08:00
+// Last Modified At: 2026-11-10 19:09:21 +08:00
 #pragma once
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -86,4 +86,6 @@ private:
     DWORD m_req_seq{};          //当前请求序号（和注册表里的 TaskbarSplitReqSeq 一致）
     SplitStatus m_status{};
     std::wstring m_last_msg;
+    //最近一次 RefreshStatus 里，交给窗口锚定的"块宽/是否生效"有没有变（工作线程据此决定要不要马上搬窗口）
+    bool m_anchor_state_changed{ false };
 };

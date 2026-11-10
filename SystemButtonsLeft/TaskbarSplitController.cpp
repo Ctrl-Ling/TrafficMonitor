@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-09 17:39:27 +08:00
+// Last Modified At: 2026-11-10 19:10:28 +08:00
 #include "framework.h"
 #include <cstring>
 #include <shlwapi.h>
@@ -419,8 +419,9 @@ void CTaskbarSplitController::RefreshStatus()
     m_status.split_active = (active != 0 && helper_pid != 0 && tray_pid != 0 && helper_pid == tray_pid);
     m_status.block_width_100 = m_status.split_active ? static_cast<int>(SplitRegReadDword(kRegBlock, 0)) : 0;
     m_status.block_width = m_status.block_width_100 / 100;
-    //把按钮块的右边界交给窗口锚定模块——TM 的任务栏窗口就摆在这条线后面（这一步不需要主程序参与）
-    CTaskbarWndAnchor::UpdateState(m_status.split_active, m_status.block_width_100);
+    //把按钮块的右边界交给窗口锚定模块——TM 的任务栏窗口就摆在这条线后面（这一步不需要主程序参与）。
+    //顺手记下"变了没有"：注册表监视线程收到助手上报的新块宽后要马上搬一次窗口，见 OnHelperStateChanged。
+    m_anchor_state_changed = CTaskbarWndAnchor::UpdateState(m_status.split_active, m_status.block_width_100);
     //诊断码只有“当前这个 explorer 里的助手”写过的才算数：进程号对不上就是 explorer 重启后留下的旧值
     m_status.helper_step = (helper_pid != 0 && helper_pid == tray_pid)
         ? static_cast<int>(SplitRegReadDword(kRegStep, 0)) : 0;
@@ -493,6 +494,15 @@ DWORD WINAPI CTaskbarSplitController::StateWatchThreadEntry(LPVOID param)
 void CTaskbarSplitController::OnHelperStateChanged()
 {
     RefreshStatus();
+    //助手刚把新的按钮块边界写进注册表（开关小组件、改任务栏高度、点托盘折叠都会来一次），
+    //这一刻必须马上把 TM 的任务栏窗口搬过去。为什么不能只更新内存里的数、等本体下一次回调再搬：
+    //插件唯一有把握反复跑在界面线程上的入口是 OnMonitorInfo，而这个回调在官方发布版的本体上
+    //到底调不调用没有依据（诊断行的 sy= 就是专门量这件事的）；一旦它不调，"块宽变了"就只是改了个数，
+    //TM 的窗口要等系统截图那种外部事件把本体逼得重新摆一次窗口才跟上——
+    //用户看到的就是“关了小组件 TM 还杵在老地方 / 开了小组件 TM 压在小组件上”。
+    //搬窗口只用 SetWindowPos，不碰子类过程也不碰宿主接口，在工作线程上做是安全的。
+    if (m_anchor_state_changed)
+        CTaskbarWndAnchor::ApplyNow();
     if (!m_enabled)
         return;
     //助手证明自己钉住了 -> 把 Windows 切到“居中”（这是拆分布局的前提）。
