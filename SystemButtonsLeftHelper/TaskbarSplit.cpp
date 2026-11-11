@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-11 09:37:56 +08:00
+// Last Modified At: 2026-11-11 18:31:35 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -645,18 +645,19 @@ static bool WidgetsGone(FrameworkElement const& element)
 //把小组件元素的现场（可见性 + ActualWidth）记一笔，供诊断那一行打印。
 //为什么要记：关掉小组件到底是"折叠了"（走可见性）、"从树上摘掉"（走 Unloaded）、
 //还是"还说明明可见但宽 0"（两条都不认，得换别的眼神），一编译就能看出来，不用猜。
+//注意 2 这个值不能写成枚举名：Windows 头文件里有个对象宏就叫 Hidden（mciapi 那一族），
+//winrt::...::Visibility::Hidden 会被宏展开拆掉，CI 报的就是 C2838/C2065 'Hidden'。
+//所以只按名字比 Visible 和 Collapsed，剩下那一种（Hidden）直接用"两个都不是"得到。
 static void RecordWidgetsState(FrameworkElement const& element)
 {
     try
     {
         const auto visibility = element.Visibility();
-        int state = -1;
+        int state = 2;        //2=Hidden：既不是 Visible 也不是 Collapsed，那就只剩这一个
         if (visibility == winrt::Windows::UI::Xaml::Visibility::Visible)
             state = 0;
         else if (visibility == winrt::Windows::UI::Xaml::Visibility::Collapsed)
             state = 1;
-        else if (visibility == winrt::Windows::UI::Xaml::Visibility::Hidden)
-            state = 2;
         g_widgets_visibility_state = state;
         g_widgets_actual_width_100 =
             static_cast<int>(std::lround(NotNegative(element.ActualWidth()) * 100.0));
