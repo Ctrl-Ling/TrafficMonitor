@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 10:55:15 +08:00
+// Last Modified At: 2026-11-12 12:01:10 +08:00
 #include "framework.h"
 #include <cstdio>
 #include <cwchar>
@@ -107,10 +107,10 @@ static void RefreshStatusLines(HWND hDlg)
         ::swprintf_s(buf, L"窗口跟随：还没挂上（任务栏窗口打开后本体下一次刷新就挂）");
     SetStatusLine(hDlg, IDC_STATUS_LINE7, buf);
 
-    //224 个 wchar：助手那一行加到 why=/pv=/pw= 以后最长约 110 字符，128 看着够，
+    //256 个 wchar：助手那一行加到 why=/pv=/pw=/ld/ms/dw= 以后最长约 140 字符，128 看着够，
     //但 n= 那几个计数涨到四位数就顶边了 —— 读不下时 SplitRegReadString 直接失败，
     //界面显示"助手还没报上来"，那是假象（助手明明在报），害人多猜一轮。
-    wchar_t edges[224]{};
+    wchar_t edges[256]{};
     if (SplitRegReadString(kRegEdges, edges, sizeof(edges) / sizeof(edges[0])) && edges[0] != L'\0')
         ::swprintf_s(buf, L"按钮右边界：%s", edges);
     else

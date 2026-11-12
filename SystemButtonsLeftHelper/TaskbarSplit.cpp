@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 10:55:15 +08:00
+// Last Modified At: 2026-11-12 12:01:10 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -60,6 +60,14 @@ static std::atomic<long> g_arrange_call_count{ 0 };
 //左侧按钮块里每个按钮“右边沿到哪儿了”（DIP），下标 = (int)SystemButton。
 //块宽不是算出来的，是这四个按钮各自报上来的右边沿里最大的那个。
 static std::atomic<double> g_button_right_edge_dip[4]{ 0.0, 0.0, 0.0, 0.0 };
+//每个按钮"看得见"的左沿和宽度（DIP），下标同上。块宽只看右沿，但摆位置不看右沿：
+//摆第 N 个按钮要的是"前面那 N-1 个各占多宽"，这个宽度必须用眼睛量出来的那份。
+//为什么另起一格存：排位置那一路原来用 GetButtonExtent（第一个孩子的 DesiredSize），
+//搜索切成"搜索图标和标签"以后，那个壳的 DesiredSize 还是空壳的 106 DIP，
+//而屏幕上搜索框实际占 44~268 DIP —— 于是多任务视图被摆在 151 DIP（189 像素）处，
+//正好压进搜索框肚子里，小组件跟着叠上去（就是他这张截图）。
+static std::atomic<double> g_button_visible_left_dip[4]{ 0.0, 0.0, 0.0, 0.0 };
+static std::atomic<double> g_button_visible_width_dip[4]{ 0.0, 0.0, 0.0, 0.0 };
 //块宽到底是按“看得见的边界”算的还是退回排版矩形算的，写进诊断：
 //这两种数差着一两个按钮位，光看数字分不清是算法错了还是这个系统上拿不到 peer。
 static std::atomic<bool> g_edge_from_uia{ false };
@@ -88,6 +96,12 @@ static std::atomic<int> g_widgets_gone_reason{ -1 };
 //如果 why=0 还在，就看这两个数 —— 父亲说 Visible 且宽度还是满的，说明收起来的那层在更上面或压根不是靠折叠。
 static std::atomic<int> g_widgets_parent_state{ -1 };
 static std::atomic<int> g_widgets_parent_width_100{ 0 };
+//最后一轮对小组件那一格的两条结论：ld= IsLoaded（1 在活树上 / 0 不在了 / -1 问不出来），
+//ms= 这一次到底量到了没有（1 量到 / 0 没量到）。
+//为什么两个都要：ms= 是为了把 why=0 的两种意思分开 —— "量到了所以不需要判" 和
+//"判不出来所以维持旧值"在上一版长得一模一样，白看一眼。
+static std::atomic<int> g_widgets_loaded_state{ -1 };
+static std::atomic<int> g_widgets_measured_flag{ -1 };
 //小组件按钮的"尺寸/挂载刚变"事件订在哪个实例上：同一个实例只订一次，换了实例（重新创建）就换人。
 //光比 abi 指针不行：旧元素被回收后，新元素完全可能拿到同一个地址，那就漏订了，
 //所以再存一份弱引用 —— 引用失效（旧元素死了）就说明指针相同也不可能是同一个东西，必须重订。
@@ -319,6 +333,26 @@ static void CollectPinnedChildren(FrameworkElement const& root, std::vector<Pinn
     }
 }
 
+//排在前面这一格到底占多宽：优先用眼睛量出来的可见宽度（RecordButtonSpan 存的），
+//量不到（这一格还没排过 / peer 拿不到）才退回第一个孩子的 DesiredSize。
+//为什么要留退回那一路：第一轮排版时四个按钮谁都没量过，全 0 就会把后面三个挤进开始按钮里。
+//任务栏竖着摆的时候不许用可见宽度：那一路量的是横坐标（左右边界），和竖排的"占多高"不是一回事，
+//拿它去排只会把按钮排飞，所以竖排一律维持原来的 DesiredSize。
+static double ClusterSlotWidth(PinnedChild const& child, bool vertical)
+{
+    if (!vertical)
+    {
+        const int index = static_cast<int>(child.button);
+        if (index >= 0 && index < 4)
+        {
+            const double visible = g_button_visible_width_dip[index].load();
+            if (visible > 8.0)
+                return visible;
+        }
+    }
+    return child.extent;
+}
+
 //排在 target 前面的那几个按钮一共多宽（顺序按 Windows 自己的排法：开始、搜索、多任务视图）
 //children_out 带上时，把这次看到的按钮一并交出去：块宽要判断"这一组里还有谁"，
 //同一轮排版里已经走过的树不该再走第二遍（Arrange 的调用非常频繁）。
@@ -334,7 +368,7 @@ static double ComputeClusterOffset(FrameworkElement const& frame, SystemButton t
     {
         int rank = static_cast<int>(c.button);
         if (rank >= 0 && rank < target_rank && IsPinnedClusterButton(c.button))
-            offset += c.extent;
+            offset += ClusterSlotWidth(c, vertical);
     }
     return offset;
 }
@@ -468,56 +502,258 @@ static void PostToTaskbarThread(FrameworkElement const& element, void(*func)(Fra
     }
 }
 
-//眼睛看到的右边界，以 UIA 的 BoundingRectangle 为准 —— 那才是屏幕上真正占位的那一块。
+//这一组函数管一件事：眼睛看到的边界，以 UIA 的 BoundingRectangle 为准 —— 那才是屏幕上真正占位的那一块。
 //为什么不能继续用排版矩形（X+Width）：实测四格里只有开始按钮对得上，其余全都偏：
-//  搜索那个元素排出来宽是 0（报 44.80，可见图标在 44~88）；
+//  搜索那个元素排出来宽是 0（报 44.80，可见搜索框其实在 44~268）；
 //  多任务视图报 88.80，可见按钮其实在 88~132；
 //  小组件按钮的矩形比天气图标宽出一大截（报 348.80，可见右边界只有 184）。
-//也就是说排版矩形和可见内容是两套坐标，拿它当块宽，TM 一会儿压住按钮、一会儿空一大条。
+//也就是说排版矩形和可见内容是两套坐标，拿它当块宽、更拿它排后面按钮的位置，
+//TM 一会儿压住按钮、一会儿空一大条，左侧几个按钮还会叠在一起。
 //拿不到 peer、或算出个离谱的数，就退回排版矩形（保持原来的行为，不会更糟）。
 //out_visible=false 表示这个按钮现在根本不占位：小组件在设置里关掉后元素还挂在树上，
 //但已经折叠了，它自己再也不会来报"我不在了"，只能靠这个判断把它那一格抹掉。
-static double VisibleRightEdgeDip(FrameworkElement const& element, double fallback_edge_dip,
+//一个按钮"看得见"的范围：左右边界和宽度，都换算成相对任务栏左沿的 DIP。
+//ok = 这一格现在占位；from_uia = 这几个数是可见边界（false 时只有 right 是调用方给的兜底排版右沿，
+//宽度未知，不能拿它去排后面的按钮）；visible 由调用方的 out_visible 带出去。
+struct VisibleSpan
+{
+    bool ok = false;
+    bool from_uia = false;
+    double left = 0.0;
+    double right = 0.0;
+    double width = 0.0;
+};
+
+//任务栏的左沿和它的窗口 DPI：UIA 给的是屏幕物理像素，必须减掉左沿、再按 DPI 折算，
+//才是别的函数用的那套 DIP 坐标。拿不到就当这一轮没量到（调用方退回排版矩形）。
+static bool TrayFrame(RECT* out_rc, UINT* out_dpi)
+{
+    const HWND tray = ::FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (tray == nullptr || !::GetWindowRect(tray, out_rc))
+        return false;
+    UINT dpi = ::GetDpiForWindow(tray);
+    if (dpi < 96)
+        dpi = 96;
+    *out_dpi = dpi;
+    return true;
+}
+
+//把一段物理像素边界并进 span（相对任务栏左沿、按窗口 DPI 折算成 DIP）。
+//宽或高为 0 = 这块现在看不见，不收。
+static bool UnionBoundsIntoSpan(Rect const& bounds, RECT const& tray_rc, UINT dpi, VisibleSpan* io)
+{
+    if (!std::isfinite(bounds.Width) || !std::isfinite(bounds.Height) ||
+        bounds.Width <= 0.0 || bounds.Height <= 0.0)
+        return false;
+
+    const double scale = 96.0 / dpi;
+    const double left = (static_cast<double>(bounds.X) - tray_rc.left) * scale;
+    const double right = (static_cast<double>(bounds.X) + bounds.Width - tray_rc.left) * scale;
+    //任务栏再宽也不会到十万 DIP，越界说明这个版本的 peer 给的坐标不是这个意思
+    if (!std::isfinite(left) || !std::isfinite(right) || right <= 0.0 || right > 100000.0)
+        return false;
+    //只算"竖着落在任务栏那一条里"的：往下并孩子的时候，模板里可能挂着开始菜单/搜索面板那种
+    //整屏大的内容宿主（它也在视觉树上，但它是弹出来的岛），并进来的话这一格会一口气报出半屏宽，
+    //TM 直接被顶到屏幕中间去。判据就用最直白的：这块的中心点得在任务栏那条带子里。
+    const double mid_y = static_cast<double>(bounds.Y) + bounds.Height / 2.0;
+    if (mid_y < static_cast<double>(tray_rc.top) || mid_y >= static_cast<double>(tray_rc.bottom))
+        return false;
+
+    if (!io->ok)
+    {
+        io->ok = true;
+        io->left = left;
+        io->right = right;
+    }
+    else
+    {
+        if (left < io->left)
+            io->left = left;
+        if (right > io->right)
+            io->right = right;
+    }
+    io->width = io->right - io->left;
+    io->from_uia = true;
+    return true;
+}
+
+//往下走两层，把孩子的可见边界并进父亲的范围里。
+//为什么必须往下走：搜索那一格挂的是 Taskbar.TaskbarExtensionElement，它自己是个宽约 0 的空壳，
+//真正撑开的是壳里面的搜索框按钮。实测（UIA 原始树，物理像素，1920 宽屏 @125%）：
+//  开始 0~56、搜索 55~335、多任务视图 189~244、小组件 251~440。
+//搜索那一格只量壳的话报的是 44.8~44.8（约等于没占位），于是两件事同时坏：
+//  1) 多任务视图被摆在"开始+搜索的 DesiredSize"= 151 DIP（189 像素）处，正好压进搜索框肚子里；
+//  2) 小组件跟着叠上去，块宽也少算一整个搜索框。
+//只在"自己量出来不足 8 DIP"时才往下并孩子（开始/多任务/小组件自己就是可见那一块，一次都不多走）：
+//Arrange 每帧都跑，不能每趟都把子树扫一遍。
+static void UnionChildSpans(FrameworkElement const& element, RECT const& tray_rc, UINT dpi,
+    VisibleSpan* io, int depth)
+{
+    if (depth > 2)
+        return;
+    try
+    {
+        const int count = xaml_media::VisualTreeHelper::GetChildrenCount(element);
+        for (int i = 0; i < count && i < 8; i++)
+        {
+            auto child = xaml_media::VisualTreeHelper::GetChild(element, i).try_as<FrameworkElement>();
+            if (!child)
+                continue;
+            try
+            {
+                auto peer = xaml_peers::FrameworkElementAutomationPeer::CreatePeerForElement(child);
+                if (peer)
+                    UnionBoundsIntoSpan(peer.GetBoundingRectangle(), tray_rc, dpi, io);
+            }
+            catch (...)
+            {
+            }
+            UnionChildSpans(child, tray_rc, dpi, io, depth + 1);
+        }
+    }
+    catch (...)
+    {
+    }
+}
+
+//只并"叶子"的可见边界：往下走，还有孩子的容器自己不并、只往里走。
+//为什么小组件那一格要这么量：它的按钮边界是 251~440，可右边那 100 像素是什么都没画的点击热区
+//（天气图标在 269~299、温度文字到 340 就结束）。按按钮边界报块宽，TM 就得在小组件后面空出 80 多像素；
+//再赶上搜索框切成"图标和标签"、整组右移，TM 会直接压到第一个应用图标上。
+//反过来，搜索那一格不许这么量：它的圆角底是模板里的 Border，UIA 里压根没这个孩子，
+//只看叶子只剩放大镜和两个字（171~221），TM 会压进搜索框肚子里。
+//所以这条只给小组件用，别的三格照旧用按钮自己的边界。
+static void CollectLeafSpans(FrameworkElement const& element, RECT const& tray_rc, UINT dpi,
+    VisibleSpan* io, int depth)
+{
+    int count = 0;
+    try
+    {
+        if (depth <= 4)
+            count = xaml_media::VisualTreeHelper::GetChildrenCount(element);
+    }
+    catch (...)
+    {
+        count = 0;
+    }
+
+    if (count <= 0)
+    {
+        try
+        {
+            auto peer = xaml_peers::FrameworkElementAutomationPeer::CreatePeerForElement(element);
+            if (peer)
+                UnionBoundsIntoSpan(peer.GetBoundingRectangle(), tray_rc, dpi, io);
+        }
+        catch (...)
+        {
+        }
+        return;
+    }
+
+    for (int i = 0; i < count && i < 8; i++)
+    {
+        try
+        {
+            auto child = xaml_media::VisualTreeHelper::GetChild(element, i).try_as<FrameworkElement>();
+            if (child)
+                CollectLeafSpans(child, tray_rc, dpi, io, depth + 1);
+        }
+        catch (...)
+        {
+        }
+    }
+}
+
+//VisibleWidgetsSpanDip 量不到叶子时要退回 VisibleSpanDip，那个函数定义在下面，先在这儿前置声明。
+static VisibleSpan VisibleSpanDip(FrameworkElement const& element, double fallback_edge_dip,
+    bool* out_visible);
+
+//小组件那一格专用的"看得见"范围：先按叶子量，叶子一个都没有（这个版本的模板换了、
+//或者它现在整个折叠着）才退回按钮自己的边界，再退回排版矩形。
+//返回的 visible=false 含义和 VisibleSpanDip 一致：这一格现在不占位，该把格子抹掉。
+static VisibleSpan VisibleWidgetsSpanDip(FrameworkElement const& element, double fallback_edge_dip,
     bool* out_visible)
 {
     if (out_visible != nullptr)
         *out_visible = true;
+
+    RECT tray_rc{};
+    UINT dpi = 96;
+    if (!TrayFrame(&tray_rc, &dpi))
+    {
+        VisibleSpan span;
+        span.ok = true;
+        span.right = fallback_edge_dip;
+        return span;
+    }
+
+    VisibleSpan leaf;
     try
     {
-        auto peer = xaml_peers::FrameworkElementAutomationPeer::CreatePeerForElement(element);
-        if (!peer)
-            return fallback_edge_dip;
-
-        //BoundingRectangle 是屏幕物理像素；宽或高为 0 = 这个按钮现在看不见
-        Rect bounds = peer.GetBoundingRectangle();
-        if (!std::isfinite(bounds.Width) || !std::isfinite(bounds.Height) ||
-            bounds.Width <= 0.0 || bounds.Height <= 0.0)
-        {
-            if (out_visible != nullptr)
-                *out_visible = false;
-            return 0.0;
-        }
-
-        const HWND tray = ::FindWindowW(L"Shell_TrayWnd", nullptr);
-        RECT tray_rc{};
-        UINT dpi = 96;
-        if (tray == nullptr || !::GetWindowRect(tray, &tray_rc))
-            return fallback_edge_dip;
-        dpi = ::GetDpiForWindow(tray);
-        if (dpi < 96)
-            dpi = 96;
-
-        const double edge = (static_cast<double>(bounds.X) + bounds.Width - tray_rc.left) * 96.0 / dpi;
-        //任务栏再宽也不会到十万 DIP，越界说明这个版本的 peer 给的坐标不是这个意思
-        if (!std::isfinite(edge) || edge <= 0.0 || edge > 100000.0)
-            return fallback_edge_dip;
-        g_edge_from_uia.store(true);
-        return edge;
+        CollectLeafSpans(element, tray_rc, dpi, &leaf, 0);
     }
     catch (...)
     {
-        return fallback_edge_dip;
     }
+    if (leaf.from_uia)
+    {
+        g_edge_from_uia.store(true);
+        return leaf;
+    }
+    return VisibleSpanDip(element, fallback_edge_dip, out_visible);
+}
+
+static VisibleSpan VisibleSpanDip(FrameworkElement const& element, double fallback_edge_dip,
+    bool* out_visible)
+{
+    if (out_visible != nullptr)
+        *out_visible = true;
+
+    VisibleSpan span;
+    bool peer_ok = false;
+    bool frame_ok = false;
+    RECT tray_rc{};
+    UINT dpi = 96;
+
+    try
+    {
+        auto peer = xaml_peers::FrameworkElementAutomationPeer::CreatePeerForElement(element);
+        if (peer)
+            peer_ok = true;
+
+        frame_ok = TrayFrame(&tray_rc, &dpi);
+
+        if (peer_ok && frame_ok)
+        {
+            UnionBoundsIntoSpan(peer.GetBoundingRectangle(), tray_rc, dpi, &span);
+            if (!span.from_uia || span.width < 8.0)
+                UnionChildSpans(element, tray_rc, dpi, &span, 0);
+        }
+    }
+    catch (...)
+    {
+    }
+
+    if (span.from_uia)
+    {
+        g_edge_from_uia.store(true);
+        return span;
+    }
+
+    //量不到任何可见边界，分两种：peer 和坐标都拿到、却连孩子都是空的 —— 这一格现在确实不占位
+    //（小组件在设置里关掉就是这种：元素还挂在树上但整个折叠了），按"看不见"交回调用方去抹格子；
+    //剩下那种（拿不到 peer / 拿不到任务栏 / 数离谱）才是真的没量到，退回排版矩形，行为跟以前一样。
+    if (peer_ok && frame_ok)
+    {
+        if (out_visible != nullptr)
+            *out_visible = false;
+        return span;
+    }
+
+    span.ok = true;
+    span.right = fallback_edge_dip;
+    return span;
 }
 
 //四个按钮各自报上来的右边沿，一行写清楚。为什么要这一行：块宽只有一个数，
@@ -533,10 +769,14 @@ static double VisibleRightEdgeDip(FrameworkElement const& element, double fallba
 //why= 是"这一格该不该抹掉"最终采纳的判据（见 WidgetsGoneReason）；pv=/pw= 是直系父亲的现场，
 //why=0（几条都不认）时靠这两个数看收起来的那一层到底在不在父亲身上。
 //pub 不在这里重复了，"助手已挂钩，块宽 …"那一行给的就是同一个数。
+//dw= 是这四个按钮各自"看得见"的宽度（开始/搜索/多任务/小组件，1/100 DIP）—— 摆位置那一路用的就是这四个数：
+//第 N 个按钮摆在"前面几格宽度之和"处。搜索切成"图标和标签"时这里应当从 ~10600 跳到 ~22400，
+//没跳就是可见宽度没量到（那一格还在用 DesiredSize 兜底），多任务和小组件会继续叠在搜索框肚子里。
+//小组件那一格（dw 最后一位）量的是天气图标+温度文字，不含按钮右边那段没画东西的热区。
 static void PublishEdges()
 {
-    wchar_t edges[200]{};
-    ::swprintf_s(edges, L"s=%d se=%d tv=%d w=%d src=%s n=%d/%d/%d/%d ev=%d vis=%d aw=%d why=%d pv=%d pw=%d",
+    wchar_t edges[256]{};
+    ::swprintf_s(edges, L"s=%d se=%d tv=%d w=%d src=%s n=%d/%d/%d/%d ev=%d vis=%d aw=%d why=%d pv=%d pw=%d ld=%d ms=%d dw=%d/%d/%d/%d",
         static_cast<int>(std::lround(g_button_right_edge_dip[0].load() * 100.0)),
         static_cast<int>(std::lround(g_button_right_edge_dip[1].load() * 100.0)),
         static_cast<int>(std::lround(g_button_right_edge_dip[2].load() * 100.0)),
@@ -551,7 +791,13 @@ static void PublishEdges()
         g_widgets_actual_width_100.load(),
         g_widgets_gone_reason.load(),
         g_widgets_parent_state.load(),
-        g_widgets_parent_width_100.load());
+        g_widgets_parent_width_100.load(),
+        g_widgets_loaded_state.load(),
+        g_widgets_measured_flag.load(),
+        static_cast<int>(std::lround(g_button_visible_width_dip[0].load() * 100.0)),
+        static_cast<int>(std::lround(g_button_visible_width_dip[1].load() * 100.0)),
+        static_cast<int>(std::lround(g_button_visible_width_dip[2].load() * 100.0)),
+        static_cast<int>(std::lround(g_button_visible_width_dip[3].load() * 100.0)));
     SplitRegWriteStringIfChanged(kRegEdges, edges);
 }
 
@@ -598,6 +844,13 @@ static bool ForgetAbsentButtons(std::vector<PinnedChild> const& children)
     bool changed = false;
     for (int i = 0; i < 4; i++)
     {
+        if (!present[i])
+        {
+            //这一格不在树上了，宽度那一路也要一起清掉：不清的话后面几个按钮还会
+            //按"它还在占 224 DIP"往后排，左边就空出一条谁都不占的位子。
+            g_button_visible_left_dip[i] = 0.0;
+            g_button_visible_width_dip[i] = 0.0;
+        }
         if (!present[i] && g_button_right_edge_dip[i].load() != 0.0)
         {
             g_button_right_edge_dip[i] = 0.0;
@@ -627,8 +880,27 @@ static void PublishBlockFromSlots()
     PublishBlockWidth(block);
 }
 
+//记下某个按钮"看得见"的左沿和宽度：块宽用右沿（走 UpdateBlockEnd），
+//摆后面按钮的位置用这里的宽度（走 ClusterSlotWidth）。量不到就把这两格清零，
+//让后面那一格退回 DesiredSize 那条路 —— 宁可沿用系统的排法，也别拿一个 0 宽去排，
+//那会把多任务和小组件全叠到开始按钮上。
+static void RecordButtonSpan(SystemButton button, VisibleSpan const& span)
+{
+    const int index = static_cast<int>(button);
+    if (index < 0 || index >= 4)
+        return;
+    if (!span.from_uia || span.width <= 0.0)
+    {
+        g_button_visible_left_dip[index] = 0.0;
+        g_button_visible_width_dip[index] = 0.0;
+        return;
+    }
+    g_button_visible_left_dip[index] = span.left;
+    g_button_visible_width_dip[index] = span.width;
+}
+
 //某个按钮报上自己“看得见”的右边沿（DIP）：把它那一格记下来，块宽取四格里最大的那格。
-//数的来源见上面 VisibleRightEdgeDip 的说明（UIA 边界为准，排版矩形只当兜底）；
+//数的来源见上面 VisibleSpanDip 的说明（UIA 边界为准，排版矩形只当兜底）；
 //更早的版本是拿 ComputeClusterOffset + GetButtonExtent 另算一套（DesiredSize 会跟着天气文字、
 //悬停宽度上下飘），而且只会变大不会变小 —— 实测注册表里长期挂着 348，而小组件真实右边沿只有 184，
 //TM 把窗口钉在这个数后面就一会儿空一条、一会儿压住小组件。
@@ -647,7 +919,11 @@ static void UpdateBlockEnd(SystemButton button, double right_edge_dip)
 static void ClearBlockEnd(SystemButton button)
 {
     const int index = static_cast<int>(button);
-    if (index < 0 || index >= 4 || g_button_right_edge_dip[index].load() == 0.0)
+    if (index < 0 || index >= 4)
+        return;
+    g_button_visible_left_dip[index] = 0.0;
+    g_button_visible_width_dip[index] = 0.0;
+    if (g_button_right_edge_dip[index].load() == 0.0)
         return;
     g_button_right_edge_dip[index] = 0.0;
     PublishBlockFromSlots();
@@ -698,24 +974,47 @@ static void RecordParentState(FrameworkElement const& parent)
     }
 }
 
+//元素还在不在"活树"上：1=在（已加载），0=不在了，-1=问不出来（当成在，别乱抹）。
+//这是比可见性、比 UIA 边界都更硬的一条判据：FrameworkElement.IsLoaded 只有在元素挂在一个
+//已加载的根上时才为真，被从树上摘掉、被塞回模板缓存、岛被拆掉 —— 全都立刻变 false，
+//而它的 ActualWidth 和 peer 边界却可能原封不动地留着旧值（实测就是：关掉小组件后
+//vis 还是 Visible、aw 还是 216、peer 还能给出一个 291 DIP 的右边界，全是死人的遗照）。
+//所以这一条要在信任任何测量结果之前问一遍，否则那一格会被一个已死元素的旧边界一直续命。
+static int WidgetsLoadedCode(FrameworkElement const& element)
+{
+    try
+    {
+        return element.IsLoaded() ? 1 : 0;
+    }
+    catch (...)
+    {
+        return -1;      //这个版本的投影没有这个属性/问不出来：不许据此抹，维持原判
+    }
+}
+
 //小组件到底"在不在"，判出来的是哪一种情况（写进诊断 why=，一编译就能看到这台 shell 用的是哪一招）：
+//  6 = 元素已经不在活树上了（IsLoaded=false）—— 最硬的一条，见 WidgetsLoadedCode；
 //  1 = 它自己 Visibility 不是 Visible；
-//  2 = 往上某一层祖先被折叠了 —— 怀疑这台就是这个：关掉小组件后按钮自己还是 vis=0、aw=21600，
-//      它自己什么都没说，是 shell 把外面那一层收起来了，只看它自己永远判不出来；
+//  2 = 往上某一层祖先被折叠了 —— 上一版怀疑的就是这个：关掉小组件后按钮自己还是 vis=0、aw=21600；
 //  3 = UIA 给了个非空边界，但整个在任务栏之外（被挪走了，不是"暂时量不到"）；
 //  4 = 祖先虽然写着 Visible，却被排成某个方向 0 尺寸（不占地方，但不是用折叠做到的）；
 //  5 = （这条不在这儿产生，是 OnWidgetsEvent 记的）Unloaded —— 元素整个从树上摘掉了；
 //  0 = 一条都没判出来 —— 那才是出现动画的中间态，维持上一次的值，等下一个事件重量。
-//为什么进这个函数要先"量不到"：只有 VisibleRightEdgeDip 说看不见（空边界）才来问原因，
+//为什么进这个函数要先"量不到"：只有 VisibleWidgetsSpanDip 说看不见（自己和叶子都是空的）才来问原因，
 //量得到就直接用量的数，免得判据把好端端的现场误抹掉。
 //为什么不看 ActualWidth 或"边界为空"就断定不在了：出现动画那一下它们本来就是 0，
 //照着抹等于把"刚打开、马上就有"当成"不在了"，块宽停在没开的那个数 —— TM 压住小组件。
 //注：UWP（Windows.UI.Xaml）的投影里没有 FrameworkElement.IsVisible()，那是 WinUI3 才有的（CI 报过 C2039）；
+//IsLoaded 不一样，它是 UWP 的 FrameworkElement 上就有的只读属性。万一这个投影也不认，
+//CI 会报 C2039 'IsLoaded'，那就把 WidgetsLoadedCode 整块删掉（第 6 层判据作废），其余几层照编。
 //这里用的 GetParent/try_as/Visibility/ActualWidth/GetBoundingRectangle/FindWindow 都是本文件已经编过的写法。
 static int WidgetsGoneReason(FrameworkElement const& element)
 {
     try
     {
+        if (WidgetsLoadedCode(element) == 0)
+            return 6;
+
         if (VisibilityCode(element.Visibility()) != 0)
             return 1;
 
@@ -771,11 +1070,24 @@ static void RepublishWidgetsEdge(FrameworkElement const& element, double fallbac
     if (!g_enabled_cache.load())
         return;
     RecordWidgetsState(element);
+    //第一问不是"能不能量到"，而是"这个元素还挂在活树上吗"：被摘掉的元素照样能报出
+    //上一个版本的 ActualWidth 和 UIA 边界（见 WidgetsLoadedCode 里那组实测数字），
+    //让它过这一关就等于一个死按钮天天给自己那一格续命，块宽永远缩不回去。
+    const int loaded = WidgetsLoadedCode(element);
     bool visible = true;
-    const double edge = VisibleRightEdgeDip(element, fallback_edge_dip, &visible);
-    const bool measured = (visible && edge > 0.0);
+    //这一格按"看得见的叶子"量（天气图标 + 温度文字），不按按钮自己的边界量：
+    //按钮边界 251~440 里右边那 100 像素是什么都没画的热区，照着它报块宽，
+    //搜索框一切成"图标和标签"、整组右移之后，TM 会一路压到第一个应用图标上。
+    const VisibleSpan span = VisibleWidgetsSpanDip(element, fallback_edge_dip, &visible);
+    const double edge = visible ? span.right : 0.0;
+    RecordButtonSpan(SystemButton::Widgets, span);
+    const bool measured = (loaded != 0 && visible && edge > 0.0);
     const int reason = measured ? 0 : WidgetsGoneReason(element);
     const int last_reason = g_widgets_gone_reason.exchange(reason);
+    //ms= 把两种 why=0 分开：量到了(1) vs 几条判据都不认(0)。上一版这两个都写 0，
+    //结果你看到 why=0 根本分不清是"它明明还在"还是"我眼神不够"。
+    g_widgets_measured_flag = measured ? 1 : 0;
+    g_widgets_loaded_state = loaded;
 
     if (measured)
         UpdateBlockEnd(SystemButton::Widgets, edge);
@@ -786,6 +1098,33 @@ static void RepublishWidgetsEdge(FrameworkElement const& element, double fallbac
     //上面两条路都不会写注册表，why= 就出不来，只能靠"没变化"去猜。这里补发一行。
     if (last_reason != reason)
         PublishEdges();
+}
+
+//别的按钮（开始/搜索/多任务视图）每次排版，顺手把小组件那一格重量一遍 —— 这一条才是治"关闭不回填"的。
+//为什么非借它们的节拍：实测关掉小组件这件事，小组件自己那一路一条事件都没送到（ev 一直停在 3），
+//祖先那一路也指望不上 —— 它父亲就是整条任务栏那么宽（pw=153600 = 1536 DIP）的面板，
+//少掉最右边一个孩子，这种面板的尺寸根本不会变，SizeChanged 自然一声不响。
+//而这三个按钮每次任务栏重排都要走我们的 Arrange（n=9/9/9），是现成、便宜、方向正确的节拍器：
+//小组件关掉后必然有一次任务栏重排，那一次就够我们把这一格判掉、抹掉、重发块宽。
+//什么时候不查：那一格本来就是 0（没开着小组件，没什么可抹的）—— 省掉每轮排版一次 UIA。
+static void RefreshWidgetsSlotFromSiblings()
+{
+    if (g_widgets_watched.empty())
+        return;
+    if (g_button_right_edge_dip[static_cast<int>(SystemButton::Widgets)].load() == 0.0)
+        return;
+    try
+    {
+        auto element = g_widgets_watched[0].get();
+        if (!element)
+            return;
+        //传 0 而不是排版矩形：这本来就是"别人在排版，我顺带看一眼小组件还在不在"，
+        //拿别人的矩形去猜它的边界只会把错的数再坐实一遍。
+        RepublishWidgetsEdge(element, 0.0);
+    }
+    catch (...)
+    {
+    }
 }
 
 //小组件事件的统一处理：记一笔 ev、按类型补账，然后（元素自己那一路）无条件发一行现场。
@@ -1048,6 +1387,8 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
         double offset = ComputeClusterOffset(frame, button, vertical, &children);
         if (ForgetAbsentButtons(children))
             PublishBlockFromSlots();
+        //借这一轮排版把小组件那一格也复核一次（关闭小组件时它是唯一会响的节拍，理由见函数上那段）
+        RefreshWidgetsSlotFromSiblings();
 
         Rect new_rect = rect;
         //把按钮摆到“前面几个按钮排完之后”的位置
@@ -1059,11 +1400,14 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
         //块宽记的是这个按钮“看得见”的右边沿（排版矩形只当作拿不到 peer 时的兜底）：
         //实测搜索那一格排出来宽是 0、多任务视图的可见图标比它的排版矩形整整右移一个按钮位，
         //照着排版矩形报，块宽就永远比屏幕上的按钮窄一截，TM 的窗口会压住按钮。
+        //同一趟里把这个按钮可见的左沿和宽度也记下来，下一轮排后面的按钮时就按这个宽度让位子
+        //（见 ClusterSlotWidth）—— 上面那个"多任务叠进搜索框"的毛病就是这两路用了两套宽度。
         bool visible = true;
         const double rect_edge = static_cast<double>(new_rect.X) + new_rect.Width;
-        const double edge = VisibleRightEdgeDip(element, rect_edge, &visible);
+        const VisibleSpan span = VisibleSpanDip(element, rect_edge, &visible);
+        RecordButtonSpan(button, span);
         if (visible)
-            UpdateBlockEnd(button, edge);
+            UpdateBlockEnd(button, span.right);
         else
             ClearBlockEnd(button);
 
