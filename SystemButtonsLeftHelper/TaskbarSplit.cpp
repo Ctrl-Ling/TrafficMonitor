@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 14:13:15 +08:00
+// Last Modified At: 2026-11-12 14:17:42 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -27,11 +27,19 @@ namespace xaml_peers = Windows::UI::Xaml::Automation::Peers;
 namespace xaml_media = Windows::UI::Xaml::Media;
 namespace xaml_shapes = Windows::UI::Xaml::Shapes;
 
-//本文件的机制（大白话）：
-//Windows 11 的任务栏是一块 XAML 界面，中间那一组（开始、搜索、多任务视图、正在运行的程序）由一个
-//“居中的排版器”决定每个按钮的位置，决定完就叫 IUIElement::Arrange(矩形) 把按钮放到那个矩形上。
-//我们把这个 Arrange 换成自己的函数：看到系统按钮就把矩形改成“从最左边开始排”，
-//同时给按钮加一个负的右边距，让排版器以为它们不占地方，于是应用图标仍然整组居中。
+//本文件的机制（大白话，方案 B「只留 B」）：
+//Windows 11 的任务栏是一块 XAML 界面，排版器决定每个按钮的位置，决定完就叫 IUIElement::Arrange(矩形)
+//把按钮摆到那个矩形上。我们把这个 Arrange 换成自己的函数。
+//B 路线不搬运系统按钮：插件把 Windows 自己的对齐值写成“靠左”（TaskbarAl=0），
+//开始/搜索/多任务视图/小组件由系统自己钉在最左边——连开始菜单和搜索飞岛也一起靠左，这正是 B 的目的。
+//于是助手只剩两件事：
+//  ①量出左边这一组按钮“看得见”的右边界，报给插件，TM 的任务栏窗口紧跟在这条线后面（下面那一路测量）；
+//  ②把应用图标那一组整组居中——系统靠左排版时它们紧跟在按钮块后面，不居中。
+//上一版“居中标本”（TaskbarAl=1，我们改 X、压负右边距把按钮搬到左边）那套已经整片删掉：
+//换成靠左基准以后它一件都不需要了，留着只会和系统的排版打架。
+//只留一处收尾：把旧版可能还挂在活树上的负边距/正左边距擦干净（见 ClearStaleClusterMargin、
+//ClearStaleWidgetsOffset）——换了 dll 但没重启 explorer 时，跑的还是旧镜像、加过的边距还在，
+//不擦就会叠在系统的靠左排版上，按钮直接飞出屏幕。
 
 //挂钩点：IUIElement::Arrange 在 XAML 对象主虚表里的槽位（不同 Windows 版本可能是别的值，
 //所以装完一定要做“自检”，看到任务栏按钮真的经过挂钩才上报 active）。
@@ -60,12 +68,14 @@ static std::atomic<long> g_arrange_call_count{ 0 };
 //左侧按钮块里每个按钮“右边沿到哪儿了”（DIP），下标 = (int)SystemButton。
 //块宽不是算出来的，是这四个按钮各自报上来的右边沿里最大的那个。
 static std::atomic<double> g_button_right_edge_dip[4]{ 0.0, 0.0, 0.0, 0.0 };
-//每个按钮"看得见"的左沿和宽度（DIP），下标同上。块宽只看右沿，但摆位置不看右沿：
-//摆第 N 个按钮要的是"前面那 N-1 个各占多宽"，这个宽度必须用眼睛量出来的那份。
-//为什么另起一格存：排位置那一路原来用 GetButtonExtent（第一个孩子的 DesiredSize），
-//搜索切成"搜索图标和标签"以后，那个壳的 DesiredSize 还是空壳的 106 DIP，
-//而屏幕上搜索框实际占 44~268 DIP —— 于是多任务视图被摆在 151 DIP（189 像素）处，
-//正好压进搜索框肚子里，小组件跟着叠上去（就是他这张截图）。
+//每个按钮"看得见"的左沿和宽度（DIP），下标同上。
+//现在只剩诊断作用（块宽用上面的右沿，摆位置那一路在 B 路线下已经删掉了），
+//但这一行仍然是"按钮叠在一起"这件事唯一的现场：dw= 里哪一位是 0，就是哪一格没量到可见宽度。
+//它当初是用来排左侧四个按钮的：上一版排位置用的是第一个孩子的 DesiredSize，
+//搜索切成"搜索图标和标签"以后那个壳的 DesiredSize 还是空壳的 106 DIP，
+//而屏幕上搜索框实际占 44~268 DIP —— 多任务视图就被摆在 151 DIP（189 像素）处压进搜索框肚子里。
+//那套自己排队位的做法在 B 路线里整片删了（排队交给系统），但这四个数继续报，
+//因为"眼睛量出来的宽度"和"排版矩形"差多少，只能靠这一行看。
 static std::atomic<double> g_button_visible_left_dip[4]{ 0.0, 0.0, 0.0, 0.0 };
 static std::atomic<double> g_button_visible_width_dip[4]{ 0.0, 0.0, 0.0, 0.0 };
 //块宽到底是按“看得见的边界”算的还是退回排版矩形算的，写进诊断：
@@ -179,10 +189,10 @@ static SystemButton IdentifySystemButton(FrameworkElement const& element);
 static bool IsPinnedClusterButton(SystemButton button);
 static bool RecordClassName(FrameworkElement const& element, Rect rect);
 static void PublishClasses();
-static void UpdateClusterCollapse(FrameworkElement const& element, bool enabled);
-static void UpdateWidgetsPosition(FrameworkElement const& element, bool enabled);
+static void ClearStaleClusterMargin(FrameworkElement const& element);
+static void ClearStaleWidgetsOffset(FrameworkElement const& element);
 static void PostToTaskbarThread(FrameworkElement const& element,
-    void(*func)(FrameworkElement const&, bool), bool enabled);
+    void(*func)(FrameworkElement const&));
 
 //windows.h 里有 max 宏，std::max 会被展开坏，这里自己做“负数就归零”
 static double NotNegative(double value)
@@ -244,24 +254,29 @@ void RestoreMarginsAsync()
     {
         SystemButton button = IdentifySystemButton(element);
         if (button == SystemButton::Widgets)
-            PostToTaskbarThread(element, UpdateWidgetsPosition, false);
+            PostToTaskbarThread(element, ClearStaleWidgetsOffset);
         else if (IsPinnedClusterButton(button))
-            PostToTaskbarThread(element, UpdateClusterCollapse, false);
+            PostToTaskbarThread(element, ClearStaleClusterMargin);
     }
 
     g_block_width_dip = 0.0;
     for (auto& edge : g_button_right_edge_dip)
         edge = 0.0;
+    for (auto& width : g_button_visible_width_dip)
+        width = 0.0;
+    for (auto& left : g_button_visible_left_dip)
+        left = 0.0;
     g_last_published_dip = -1.0;
     g_edge_from_uia = false;
     SplitRegWriteDwordIfChanged(kRegBlock, 0u);
 }
 
-//按钮固定在左侧时，居中的那一组（应用图标）不该被它们挤开：用负的边距让排版器当它们不占位
+//"这一组里现在还有谁"：块宽要判断哪个按钮已经从树上消失了，靠的就是这份名单。
+//（B 路线下它只干这一件事——名单齐了才能把消失那格抹掉；上一版还拿它算"前面几个按钮排完该摆在哪"，
+//  那套自己排队位的代码已经整片删掉，排位交给系统自己的靠左排版。）
 struct PinnedChild
 {
     SystemButton button{ SystemButton::None };
-    double extent{};
 };
 
 static bool IsPinnedClusterButton(SystemButton button)
@@ -298,31 +313,11 @@ static SystemButton IdentifySystemButton(FrameworkElement const& element)
     return SystemButton::None;
 }
 
+//任务栏是不是竖着摆的（贴在屏幕左右两侧）。居中标本删掉之后这条暂时没人用了，
+//但 B 路线剩下的那一刀（应用图标整组居中）必须分横竖两路算：横排要比屏幕宽折半，竖排要比屏幕高折半。
 static bool IsVerticalTaskbar(FrameworkElement const& frame)
 {
     return frame.ActualHeight() > frame.ActualWidth();
-}
-
-//按钮不塌陷时占多宽（ActualWidth 里含了负边距，所以优先看第一个子元素的 DesiredSize）
-static double GetButtonExtent(FrameworkElement const& element, bool vertical)
-{
-    try
-    {
-        if (xaml_media::VisualTreeHelper::GetChildrenCount(element) > 0)
-        {
-            auto child = xaml_media::VisualTreeHelper::GetChild(element, 0).try_as<FrameworkElement>();
-            if (child)
-            {
-                auto size = child.DesiredSize();
-                return vertical ? size.Height : size.Width;
-            }
-        }
-        return vertical ? element.ActualHeight() : element.ActualWidth();
-    }
-    catch (...)
-    {
-        return 0.0;
-    }
 }
 
 //递归找出某个容器下面所有系统按钮（不依赖 ItemsRepeater 的投影类型，那套头文件不在 Windows SDK 里）
@@ -348,7 +343,7 @@ static void CollectPinnedChildren(FrameworkElement const& root, std::vector<Pinn
                         exists = true;
                 }
                 if (!exists)
-                    out.push_back(PinnedChild{ button, GetButtonExtent(child, IsVerticalTaskbar(root)) });
+                    out.push_back(PinnedChild{ button });
             }
             CollectPinnedChildren(child, out, depth + 1);
         }
@@ -358,70 +353,20 @@ static void CollectPinnedChildren(FrameworkElement const& root, std::vector<Pinn
     }
 }
 
-//排在前面这一格到底占多宽：优先用眼睛量出来的可见宽度（RecordButtonSpan 存的），
-//量不到（这一格还没排过 / peer 拿不到）才退回第一个孩子的 DesiredSize。
-//为什么要留退回那一路：第一轮排版时四个按钮谁都没量过，全 0 就会把后面三个挤进开始按钮里。
-//任务栏竖着摆的时候不许用可见宽度：那一路量的是横坐标（左右边界），和竖排的"占多高"不是一回事，
-//拿它去排只会把按钮排飞，所以竖排一律维持原来的 DesiredSize。
-static double ClusterSlotWidth(PinnedChild const& child, bool vertical)
-{
-    if (!vertical)
-    {
-        const int index = static_cast<int>(child.button);
-        if (index >= 0 && index < 4)
-        {
-            const double visible = g_button_visible_width_dip[index].load();
-            if (visible > 8.0)
-                return visible;
-        }
-    }
-    return child.extent;
-}
-
-//排在 target 前面的那几个按钮一共多宽（顺序按 Windows 自己的排法：开始、搜索、多任务视图）
-//children_out 带上时，把这次看到的按钮一并交出去：块宽要判断"这一组里还有谁"，
-//同一轮排版里已经走过的树不该再走第二遍（Arrange 的调用非常频繁）。
-static double ComputeClusterOffset(FrameworkElement const& frame, SystemButton target, bool vertical,
-    std::vector<PinnedChild>* children_out = nullptr)
-{
-    std::vector<PinnedChild> local;
-    std::vector<PinnedChild>& children = (children_out != nullptr) ? *children_out : local;
-    CollectPinnedChildren(frame, children, 0);
-    double offset = 0.0;
-    int target_rank = static_cast<int>(target);
-    for (auto& c : children)
-    {
-        int rank = static_cast<int>(c.button);
-        if (rank >= 0 && rank < target_rank && IsPinnedClusterButton(c.button))
-            offset += ClusterSlotWidth(c, vertical);
-    }
-    return offset;
-}
-
-static void UpdateClusterCollapse(FrameworkElement const& element, bool enabled)
+//【只留 B 的收尾一】擦掉上一版"居中标本"给开始/搜索/多任务视图压过的负边距。
+//为什么删掉了加负边距那一路、还得留着擦：边距是加在 explorer 里那棵活的 XAML 树上的，
+//插件换 dll 并不会把已经加上去的边距带走。不重启 explorer 时进程里跑的还是旧镜像，
+//它随时可能再排一次版；而系统这会儿已经自己靠左排了，旧负边距一叠上去，
+//等于在系统的位置上再往左挪一整个按钮宽，按钮直接飞出屏幕（他见过的那种"越开越坏"）。
+//只夹负数、只夹我们写过的那两个方向（右/下）：正边距是系统和主题自己的，动它就不是复原而是捣乱。
+static void ClearStaleClusterMargin(FrameworkElement const& element)
 {
     try
     {
-        auto frame = xaml_media::VisualTreeHelper::GetParent(element).try_as<FrameworkElement>();
-        if (!frame)
-            return;
-
-        bool vertical = IsVerticalTaskbar(frame);
         Thickness margin = element.Margin();
         Thickness new_margin = margin;
-
-        //只还原本模块加过的塌陷边距（两个方向都清掉，任务栏可能在上下/左右之间切换过）
         new_margin.Right = NotNegative(new_margin.Right);
         new_margin.Bottom = NotNegative(new_margin.Bottom);
-
-        if (enabled)
-        {
-            double extent = GetButtonExtent(element, vertical);
-            if (vertical)
-                new_margin.Bottom = -extent;
-            else
-                new_margin.Right = -extent;
-        }
 
         if (new_margin.Right != margin.Right || new_margin.Bottom != margin.Bottom)
             element.Margin(new_margin);
@@ -431,61 +376,38 @@ static void UpdateClusterCollapse(FrameworkElement const& element, bool enabled)
     }
 }
 
-//小组件按钮是 Windows 钉在最前面的，用前边距把它挪到这一组按钮后面
-static void UpdateWidgetsPosition(FrameworkElement const& element, bool enabled)
+//【只留 B 的收尾二】擦掉上一版给小组件加的正左边距。
+//上一版小组件是系统钉在最前面的，所以用正的 Margin.Left 把它挪到这一组按钮后面；
+//B 路线里系统自己就把它排在小组件位上，这一刀不再需要，但和上面同理：
+//旧镜像留在树上的那份左边距必须擦掉，不然小组件会在已经靠左的位置上再往右挪一大截。
+//只认"正数"这个我们写过的签名（Left/Top 是我们那一路唯一动过的两个方向），
+//投递过来时再判一次：中间可能已经重排过，值早就不是我们加的那个了。
+static void ClearStaleWidgetsOffset(FrameworkElement const& element)
 {
     try
     {
-        auto frame = xaml_media::VisualTreeHelper::GetParent(element).try_as<FrameworkElement>();
-        if (!frame)
+        Thickness margin = element.Margin();
+        if (margin.Left <= 0.5 && margin.Top <= 0.5)
             return;
 
-        bool vertical = IsVerticalTaskbar(frame);
-        double leading = enabled ? ComputeClusterOffset(frame, SystemButton::Widgets, vertical) : 0.0;
-
-        Thickness margin = element.Margin();
         Thickness new_margin = margin;
-        if (vertical)
-        {
-            new_margin.Left = 0;
-            new_margin.Top = leading;
-        }
-        else
-        {
-            new_margin.Top = 0;
-            new_margin.Left = leading;
-        }
-
-        if (new_margin.Left != margin.Left || new_margin.Top != margin.Top)
-            element.Margin(new_margin);
+        new_margin.Left = 0;
+        new_margin.Top = 0;
+        element.Margin(new_margin);
     }
     catch (...)
     {
     }
 }
 
-static bool ClusterMarginNeedsUpdate(FrameworkElement const& element, bool enabled)
+//这一帧有没有旧版留下的边距要擦：Arrange 每帧都跑，只在真看到我们那种签名时才投递一次改边距。
+//左边/上边也一起看：任务栏可能在我们看不见的那一版里被上下摆放过，签名就换了一个方向。
+static bool StaleClusterMargin(FrameworkElement const& element)
 {
     try
     {
-        auto frame = xaml_media::VisualTreeHelper::GetParent(element).try_as<FrameworkElement>();
-        if (!frame)
-            return false;
-
-        bool vertical = IsVerticalTaskbar(frame);
         Thickness margin = element.Margin();
-        double trailing = vertical ? margin.Bottom : margin.Right;
-        double other = vertical ? margin.Right : margin.Bottom;
-
-        if (other < -0.5)
-            return true;
-
-        if (enabled)
-        {
-            double extent = GetButtonExtent(element, vertical);
-            return trailing > -extent + 0.5;
-        }
-        return trailing < -0.5;
+        return margin.Right < -0.5 || margin.Bottom < -0.5;
     }
     catch (...)
     {
@@ -493,19 +415,12 @@ static bool ClusterMarginNeedsUpdate(FrameworkElement const& element, bool enabl
     }
 }
 
-static bool WidgetsPositionNeedsUpdate(FrameworkElement const& element, bool enabled)
+static bool StaleWidgetsOffset(FrameworkElement const& element)
 {
     try
     {
-        auto frame = xaml_media::VisualTreeHelper::GetParent(element).try_as<FrameworkElement>();
-        if (!frame)
-            return false;
-
-        bool vertical = IsVerticalTaskbar(frame);
-        double leading = enabled ? ComputeClusterOffset(frame, SystemButton::Widgets, vertical) : 0.0;
         Thickness margin = element.Margin();
-        double current = vertical ? margin.Top : margin.Left;
-        return std::abs(current - leading) > 0.5;
+        return margin.Left > 0.5 || margin.Top > 0.5;
     }
     catch (...)
     {
@@ -514,13 +429,13 @@ static bool WidgetsPositionNeedsUpdate(FrameworkElement const& element, bool ena
 }
 
 //改边距会引起重新排版，正在排版时不能改，投递到该线程的消息队列里去做
-static void PostToTaskbarThread(FrameworkElement const& element, void(*func)(FrameworkElement const&, bool), bool enabled)
+static void PostToTaskbarThread(FrameworkElement const& element, void(*func)(FrameworkElement const&))
 {
     try
     {
         element.Dispatcher().TryRunAsync(
             Windows::UI::Core::CoreDispatcherPriority::High,
-            [element, func, enabled]() { func(element, enabled); });
+            [element, func]() { func(element); });
     }
     catch (...)
     {
@@ -879,9 +794,11 @@ static void PublishClasses()
 //why= 是"这一格该不该抹掉"最终采纳的判据（见 WidgetsGoneReason）；pv=/pw= 是直系父亲的现场，
 //why=0（几条都不认）时靠这两个数看收起来的那一层到底在不在父亲身上。
 //pub 不在这里重复了，"助手已挂钩，块宽 …"那一行给的就是同一个数。
-//dw= 是这四个按钮各自"看得见"的宽度（开始/搜索/多任务/小组件，1/100 DIP）—— 摆位置那一路用的就是这四个数：
-//第 N 个按钮摆在"前面几格宽度之和"处。搜索切成"图标和标签"时这里应当从 ~10600 跳到 ~22400，
-//没跳就是可见宽度没量到（那一格还在用 DesiredSize 兜底），多任务和小组件会继续叠在搜索框肚子里。
+//dw= 是这四个按钮各自"看得见"的宽度（开始/搜索/多任务/小组件，1/100 DIP）：
+//B 路线里位置交给系统排，这四个数只当现场用（眼睛量出来的宽度和排版矩形差多少，只有这一行能回答）；
+//它也是下一步"应用图标整组居中"的前例——那一组要居中，用的就是同一种量法。
+//搜索切成"图标和标签"时 dw 的第二位应当从 ~10600 跳到 ~22400，
+//没跳就是那一格压根没量到可见宽度（peer 拿不到），这一行会退回显示排版矩形的数，src= 也跟着变成 rect。
 //小组件那一格（dw 最后一位）量的是天气图标+温度文字，不含按钮右边那段没画东西的热区。
 static void PublishEdges()
 {
@@ -990,10 +907,9 @@ static void PublishBlockFromSlots()
     PublishBlockWidth(block);
 }
 
-//记下某个按钮"看得见"的左沿和宽度：块宽用右沿（走 UpdateBlockEnd），
-//摆后面按钮的位置用这里的宽度（走 ClusterSlotWidth）。量不到就把这两格清零，
-//让后面那一格退回 DesiredSize 那条路 —— 宁可沿用系统的排法，也别拿一个 0 宽去排，
-//那会把多任务和小组件全叠到开始按钮上。
+//记下某个按钮"看得见"的左沿和宽度（诊断 dw= 那一行的来源）：块宽用右沿（走 UpdateBlockEnd）。
+//量不到就把这两格清零：B 路线里位置归系统排，量不到只是这一行少一个数，不影响任何东西；
+//上一版不是这样——那版拿这个宽度排后面按钮，量不到就得退回 DesiredSize，退早了就把按钮叠在一起。
 static void RecordButtonSpan(SystemButton button, VisibleSpan const& span)
 {
     const int index = static_cast<int>(button);
@@ -1011,7 +927,7 @@ static void RecordButtonSpan(SystemButton button, VisibleSpan const& span)
 
 //某个按钮报上自己“看得见”的右边沿（DIP）：把它那一格记下来，块宽取四格里最大的那格。
 //数的来源见上面 VisibleSpanDip 的说明（UIA 边界为准，排版矩形只当兜底）；
-//更早的版本是拿 ComputeClusterOffset + GetButtonExtent 另算一套（DesiredSize 会跟着天气文字、
+//更早的那版（居中标本）另算一套（第一个孩子的 DesiredSize 会跟着天气文字、
 //悬停宽度上下飘），而且只会变大不会变小 —— 实测注册表里长期挂着 348，而小组件真实右边沿只有 184，
 //TM 把窗口钉在这个数后面就一会儿空一条、一会儿压住小组件。
 static void UpdateBlockEnd(SystemButton button, double right_edge_dip)
@@ -1446,8 +1362,10 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
             RememberTouched(element);
             //从此以后这一格不再只靠排版轮次：元素自己会报"我变了/我不在了"
             WatchWidgetsEvents(element);
-            if (WidgetsPositionNeedsUpdate(element, enabled))
-                PostToTaskbarThread(element, UpdateWidgetsPosition, enabled);
+            //B 路线里小组件由系统自己排在最左边那一组的末尾，不再需要正左边距；
+            //这里只擦旧版可能留在树上的那一份（见 ClearStaleWidgetsOffset）
+            if (StaleWidgetsOffset(element))
+                PostToTaskbarThread(element, ClearStaleWidgetsOffset);
             //小组件是这一组里最右边的一个，块宽基本就是它的右边沿。
             //数从 UIA 的可见边界拿（拿不到才退回排版矩形）：这个按钮的排版矩形比天气图标宽出一大截，
             //照着矩形报，TM 的窗口就会在小组件后面空出 160 多 DIP。
@@ -1483,8 +1401,10 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
         ReportWorkingOnce();
         RememberTouched(element);
 
-        if (ClusterMarginNeedsUpdate(element, enabled))
-            PostToTaskbarThread(element, UpdateClusterCollapse, enabled);
+        //B 路线：这三个按钮的位置由系统自己排（TaskbarAl=0 本来就把它们放在最左边），
+        //我们一个字节都不改；只把旧版可能还挂在树上的负边距擦掉，别让它叠在系统的排版上。
+        if (StaleClusterMargin(element))
+            PostToTaskbarThread(element, ClearStaleClusterMargin);
 
         if (!enabled)
         {
@@ -1493,33 +1413,25 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
         }
 
         auto frame = xaml_media::VisualTreeHelper::GetParent(element).try_as<FrameworkElement>();
-        if (!frame)
-            return g_arrange_original(p_this, rect);
-
-        bool vertical = IsVerticalTaskbar(frame);
-        //算偏移用的那份"这一组里有谁"，顺手交给块宽记账：这一轮树上没有的按钮，
-        //它那一格必须抹掉（小组件关掉后它再也不会来报），不然块宽永远缩不回去
-        std::vector<PinnedChild> children;
-        double offset = ComputeClusterOffset(frame, button, vertical, &children);
-        if (ForgetAbsentButtons(children))
-            PublishBlockFromSlots();
-        //借这一轮排版把小组件那一格也复核一次（关闭小组件时它是唯一会响的节拍，理由见函数上那段）
-        RefreshWidgetsSlotFromSiblings();
-
-        Rect new_rect = rect;
-        //把按钮摆到“前面几个按钮排完之后”的位置
-        if (vertical)
-            new_rect.Y = static_cast<float>(offset);
-        else
-            new_rect.X = static_cast<float>(offset);
+        if (frame)
+        {
+            //这一轮树上没有的按钮，它那一格必须抹掉（小组件在设置里关掉后它再也不会来报），
+            //不然块宽永远缩不回去，TM 的窗口就在按钮后面空出一大条。
+            std::vector<PinnedChild> children;
+            CollectPinnedChildren(frame, children, 0);
+            if (ForgetAbsentButtons(children))
+                PublishBlockFromSlots();
+            //借这一轮排版把小组件那一格也复核一次（关闭小组件时它是唯一会响的节拍，理由见函数上那段）
+            RefreshWidgetsSlotFromSiblings();
+        }
 
         //块宽记的是这个按钮“看得见”的右边沿（排版矩形只当作拿不到 peer 时的兜底）：
         //实测搜索那一格排出来宽是 0、多任务视图的可见图标比它的排版矩形整整右移一个按钮位，
         //照着排版矩形报，块宽就永远比屏幕上的按钮窄一截，TM 的窗口会压住按钮。
-        //同一趟里把这个按钮可见的左沿和宽度也记下来，下一轮排后面的按钮时就按这个宽度让位子
-        //（见 ClusterSlotWidth）—— 上面那个"多任务叠进搜索框"的毛病就是这两路用了两套宽度。
+        //同一趟把可见的左沿和宽度也记下来（诊断里 dw= 那一行）：B 路线不再拿它排位，
+        //但"眼睛量出来的"和"排版矩形"差多少，只有这一行能回答。
         bool visible = true;
-        const double rect_edge = static_cast<double>(new_rect.X) + new_rect.Width;
+        const double rect_edge = static_cast<double>(rect.X) + rect.Width;
         const VisibleSpan span = VisibleSpanDip(element, rect_edge, &visible);
         RecordButtonSpan(button, span);
         if (visible)
@@ -1527,7 +1439,7 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
         else
             ClearBlockEnd(button);
 
-        return g_arrange_original(p_this, new_rect);
+        return g_arrange_original(p_this, rect);
     }
     catch (...)
     {
