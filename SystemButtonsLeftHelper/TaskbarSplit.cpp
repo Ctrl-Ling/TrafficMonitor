@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-11 18:31:35 +08:00
+// Last Modified At: 2026-11-12 10:55:15 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -79,12 +79,34 @@ static std::atomic<long> g_widgets_event_count{ 0 };
 //关掉小组件到底是"折叠"、"摘掉"还是"仍说可见但宽 0"，靠这两个数分辨，写进诊断那一行。
 static std::atomic<int> g_widgets_visibility_state{ -1 };
 static std::atomic<int> g_widgets_actual_width_100{ 0 };
+//上一格"抹掉 / 不抹"的结论是哪一层判出来的（1~5=判成不在了，判据见 WidgetsGoneReason；0=判不出来所以维持旧值，-1=还没判过）。
+//为什么要写出来：这台 shell 关掉小组件时元素自己照样报 Visible、宽 216，我们只看它自己永远判不出来，
+//只能靠往上翻祖先。到底是祖先折叠、还是被排成 0 尺寸、还是整块挪出任务栏、还是几条都不认，
+//注册表里一个 why= 就知道，不用为了试判据再编一轮。
+static std::atomic<int> g_widgets_gone_reason{ -1 };
+//顺带记一笔直系父亲的现场（可见性 / ActualWidth，1/100 DIP）：
+//如果 why=0 还在，就看这两个数 —— 父亲说 Visible 且宽度还是满的，说明收起来的那层在更上面或压根不是靠折叠。
+static std::atomic<int> g_widgets_parent_state{ -1 };
+static std::atomic<int> g_widgets_parent_width_100{ 0 };
 //小组件按钮的"尺寸/挂载刚变"事件订在哪个实例上：同一个实例只订一次，换了实例（重新创建）就换人。
 //光比 abi 指针不行：旧元素被回收后，新元素完全可能拿到同一个地址，那就漏订了，
 //所以再存一份弱引用 —— 引用失效（旧元素死了）就说明指针相同也不可能是同一个东西，必须重订。
 //只在任务栏线程访问（Arrange 和这些事件都在那里）。
 static void* g_widgets_watched_abi{ nullptr };
 static std::vector<winrt::weak_ref<FrameworkElement>> g_widgets_watched;     //就一个元素：订过的那个实例（和 g_touched_elements 同一套用法）
+//父亲那层的订阅现场：直系父亲的 abi + 它的弱引用（和上面元素那一对同样的用法，防地址复用）。
+//为什么要往外层订：关掉小组件时改的是外面那一层的尺寸，按钮自己那身现场一个字节都没变
+//（可见性还是 Visible、ActualWidth 还是 216），所以它自己的 SizeChanged/Loaded 压根不会响 ——
+//只订元素自己，"关闭"这一刀就叫不醒我们，块宽永远挂着开着时的数（TM 贴不回去）。
+//父亲换人就往上把整条链重订一遍：上层可能重复订到同一个实例，
+//多出来的只是一次重测（处理函数拿的是元素自己的弱引用，元素没了就直接返回），不值得再加一层记账。
+static void* g_widgets_watched_up_abi{ nullptr };
+static std::vector<winrt::weak_ref<FrameworkElement>> g_widgets_watched_up;
+//往上翻几层祖先：判据（WidgetsGoneReason）和订阅（WatchWidgetsAncestors）必须同一个数，
+//翻得比订得深没用（判出来也没人叫醒）、订得比翻得深浪费。
+//12 层是留的余量：任务栏那棵树光按钮外面就套着 presenter/面板/根好几种壳，
+//收起来的那一层到底在第几层没实测过，宁多勿少（这一层循环一次就是一个 GetParent，不花钱）。
+static constexpr int kWidgetsAncestorWalk = 12;
 static thread_local bool g_in_hook{ false };
 
 //explorer 不重启的话，磁盘上换了新 dll，进程里可能还是旧镜像（旧代码在跑、新文件在盘上）。
@@ -503,15 +525,18 @@ static double VisibleRightEdgeDip(FrameworkElement const& element, double fallba
 //有了四格现场值就能一次分清，省掉一轮编译。src 说明这些数是"看得见的边界"还是退回了排版矩形。
 //n= 是这四个按钮各自累计经过挂钩几次（顺序还是 s/se/tv/w）：
 //某一格是 0 就说明它根本没来排版（识别或事件没覆盖到），有次数却报 0 就是量到空边界。
-//ev= 是小组件自己的事件进来了几次：光有 n= 时，"什么都没变"和"根本没发生"看着一样，
-//所以小组件事件每次都顺手强制发一行 —— 他按了开关而这一行没动，就是事件压根没来。
+//ev= 是小组件那一格收到的事件次数（它自己的 Unloaded/Loaded/SizeChanged + 祖先链的 SizeChanged 一起数）：
+//光有 n= 时，"什么都没变"和"根本没发生"看着一样，所以元素自己的事件每次都顺手强制发一行 ——
+//他按了开关而这一行没动，就是事件压根没来。（祖先那些只在真量出变化时才发，理由见 OnWidgetsEvent。）
 //vis=/aw= 是小组件元素自己的现场（可见性和 ActualWidth，单位见 SplitContract.h），
 //用来判断"关掉小组件"在系统里到底长什么样：折叠(1)/隐藏(2)/摘掉(靠 Unloaded)/还是仍可见但宽 0。
+//why= 是"这一格该不该抹掉"最终采纳的判据（见 WidgetsGoneReason）；pv=/pw= 是直系父亲的现场，
+//why=0（几条都不认）时靠这两个数看收起来的那一层到底在不在父亲身上。
 //pub 不在这里重复了，"助手已挂钩，块宽 …"那一行给的就是同一个数。
 static void PublishEdges()
 {
-    wchar_t edges[160]{};
-    ::swprintf_s(edges, L"s=%d se=%d tv=%d w=%d src=%s n=%d/%d/%d/%d ev=%d vis=%d aw=%d",
+    wchar_t edges[200]{};
+    ::swprintf_s(edges, L"s=%d se=%d tv=%d w=%d src=%s n=%d/%d/%d/%d ev=%d vis=%d aw=%d why=%d pv=%d pw=%d",
         static_cast<int>(std::lround(g_button_right_edge_dip[0].load() * 100.0)),
         static_cast<int>(std::lround(g_button_right_edge_dip[1].load() * 100.0)),
         static_cast<int>(std::lround(g_button_right_edge_dip[2].load() * 100.0)),
@@ -523,7 +548,10 @@ static void PublishEdges()
         static_cast<int>(g_button_arrange_count[3].load()),
         static_cast<int>(g_widgets_event_count.load()),
         g_widgets_visibility_state.load(),
-        g_widgets_actual_width_100.load());
+        g_widgets_actual_width_100.load(),
+        g_widgets_gone_reason.load(),
+        g_widgets_parent_state.load(),
+        g_widgets_parent_width_100.load());
     SplitRegWriteStringIfChanged(kRegEdges, edges);
 }
 
@@ -625,40 +653,26 @@ static void ClearBlockEnd(SystemButton button)
     PublishBlockFromSlots();
 }
 
-//这个元素是不是明确说了"我不占地方"：只看可见性有没有被改成 Collapsed/Hidden。
-//为什么不看 ActualWidth 或 UIA 边界：出现动画那一下它们本来就是 0，照着那个抹就等于把
-//"刚打开、马上就有"当成"不在了"，块宽停在没开的那个数 —— 正是他看到的 TM 压住小组件。
-//注：UWP（Windows.UI.Xaml）的投影里没有 FrameworkElement.IsVisible() 这个方法，那是 WinUI3 才有的，
-//CI 就是被这一条打下来的；可见性属性两边都有，就用它。
-static bool WidgetsGone(FrameworkElement const& element)
+//可见性折成诊断用的一个整数：0=Visible 1=Collapsed 2=其余（枚举只有三个值，不是前两个就只剩这一个）。
+//为什么要绕这一圈：Windows SDK 里有个叫 Hidden 的宏（mciapi 那套），
+//写 Visibility::Hidden 会被展开成整数、直接 C2838/C2065 —— CI 踩过，别再拼那个名字。
+static int VisibilityCode(Visibility visibility)
 {
-    try
-    {
-        return element.Visibility() != winrt::Windows::UI::Xaml::Visibility::Visible;
-    }
-    catch (...)
-    {
-        return false;         //问不出来就别乱清，维持上一次的值
-    }
+    if (visibility == Visibility::Visible)
+        return 0;
+    if (visibility == Visibility::Collapsed)
+        return 1;
+    return 2;
 }
 
 //把小组件元素的现场（可见性 + ActualWidth）记一笔，供诊断那一行打印。
-//为什么要记：关掉小组件到底是"折叠了"（走可见性）、"从树上摘掉"（走 Unloaded）、
-//还是"还说明明可见但宽 0"（两条都不认，得换别的眼神），一编译就能看出来，不用猜。
-//注意 2 这个值不能写成枚举名：Windows 头文件里有个对象宏就叫 Hidden（mciapi 那一族），
-//winrt::...::Visibility::Hidden 会被宏展开拆掉，CI 报的就是 C2838/C2065 'Hidden'。
-//所以只按名字比 Visible 和 Collapsed，剩下那一种（Hidden）直接用"两个都不是"得到。
+//为什么要记：上一版就是靠这两个数看出"关掉小组件后按钮自己还是 Visible/宽 216"，
+//从而把病根从"事件没来"改判到"眼神不对"。留着它们，下次再错也是一行注册表的事。
 static void RecordWidgetsState(FrameworkElement const& element)
 {
     try
     {
-        const auto visibility = element.Visibility();
-        int state = 2;        //2=Hidden：既不是 Visible 也不是 Collapsed，那就只剩这一个
-        if (visibility == winrt::Windows::UI::Xaml::Visibility::Visible)
-            state = 0;
-        else if (visibility == winrt::Windows::UI::Xaml::Visibility::Collapsed)
-            state = 1;
-        g_widgets_visibility_state = state;
+        g_widgets_visibility_state = VisibilityCode(element.Visibility());
         g_widgets_actual_width_100 =
             static_cast<int>(std::lround(NotNegative(element.ActualWidth()) * 100.0));
     }
@@ -667,26 +681,124 @@ static void RecordWidgetsState(FrameworkElement const& element)
     }
 }
 
-//小组件那一格重新量一次并记账（它自己的事件进来时走这里）。
-//量不到就什么都不做：绝不能把"这会儿量不到"当成"它不在了"抹掉，
-//抹掉的后果就是他看到的那个 bug —— 小组件明明开了，块宽还停在没开的那个数，TM 压在小组件上。
-static void RepublishWidgetsEdge(FrameworkElement const& element)
+//直系父亲的现场（可见性 + ActualWidth）。
+//why=0（几条判据都不认）时就靠这两个数：父亲说 Visible 且宽度还是满的，
+//说明收起来的那一层不在父亲身上（在更上面，或者根本不用折叠这一招），得换眼神；
+//父亲宽度已经是 0，那不管它是 Hidden 还是被排成 0 宽，都算"这格不占地方了"。
+static void RecordParentState(FrameworkElement const& parent)
+{
+    try
+    {
+        g_widgets_parent_state = VisibilityCode(parent.Visibility());
+        g_widgets_parent_width_100 =
+            static_cast<int>(std::lround(NotNegative(parent.ActualWidth()) * 100.0));
+    }
+    catch (...)
+    {
+    }
+}
+
+//小组件到底"在不在"，判出来的是哪一种情况（写进诊断 why=，一编译就能看到这台 shell 用的是哪一招）：
+//  1 = 它自己 Visibility 不是 Visible；
+//  2 = 往上某一层祖先被折叠了 —— 怀疑这台就是这个：关掉小组件后按钮自己还是 vis=0、aw=21600，
+//      它自己什么都没说，是 shell 把外面那一层收起来了，只看它自己永远判不出来；
+//  3 = UIA 给了个非空边界，但整个在任务栏之外（被挪走了，不是"暂时量不到"）；
+//  4 = 祖先虽然写着 Visible，却被排成某个方向 0 尺寸（不占地方，但不是用折叠做到的）；
+//  5 = （这条不在这儿产生，是 OnWidgetsEvent 记的）Unloaded —— 元素整个从树上摘掉了；
+//  0 = 一条都没判出来 —— 那才是出现动画的中间态，维持上一次的值，等下一个事件重量。
+//为什么进这个函数要先"量不到"：只有 VisibleRightEdgeDip 说看不见（空边界）才来问原因，
+//量得到就直接用量的数，免得判据把好端端的现场误抹掉。
+//为什么不看 ActualWidth 或"边界为空"就断定不在了：出现动画那一下它们本来就是 0，
+//照着抹等于把"刚打开、马上就有"当成"不在了"，块宽停在没开的那个数 —— TM 压住小组件。
+//注：UWP（Windows.UI.Xaml）的投影里没有 FrameworkElement.IsVisible()，那是 WinUI3 才有的（CI 报过 C2039）；
+//这里用的 GetParent/try_as/Visibility/ActualWidth/GetBoundingRectangle/FindWindow 都是本文件已经编过的写法。
+static int WidgetsGoneReason(FrameworkElement const& element)
+{
+    try
+    {
+        if (VisibilityCode(element.Visibility()) != 0)
+            return 1;
+
+        auto current = element;
+        for (int depth = 0; depth < kWidgetsAncestorWalk; depth++)
+        {
+            auto parent = xaml_media::VisualTreeHelper::GetParent(current).try_as<FrameworkElement>();
+            if (!parent)
+                break;
+            if (depth == 0)
+                RecordParentState(parent);
+            if (VisibilityCode(parent.Visibility()) != 0)
+                return 2;
+            //祖先被排成"某个方向一点地方都不占"：它肚子里那个还挂着 216 宽的小组件按钮
+            //不可能真的在屏幕上，那个 216 是上一次布局留下的旧值，别信。
+            //0 高/0 宽两种都算（任务是横着还是竖着摆的，这里不用管）。
+            if (parent.ActualWidth() <= 0.0 || parent.ActualHeight() <= 0.0)
+                return 4;
+            current = parent;
+        }
+
+        auto peer = xaml_peers::FrameworkElementAutomationPeer::CreatePeerForElement(element);
+        if (peer)
+        {
+            const Rect bounds = peer.GetBoundingRectangle();
+            const HWND tray = ::FindWindowW(L"Shell_TrayWnd", nullptr);
+            RECT tray_rc{};
+            if (tray != nullptr && ::GetWindowRect(tray, &tray_rc) &&
+                std::isfinite(bounds.Width) && std::isfinite(bounds.Height) &&
+                bounds.Width > 0.0 && bounds.Height > 0.0)
+            {
+                const double right = static_cast<double>(bounds.X) + bounds.Width;
+                const double bottom = static_cast<double>(bounds.Y) + bounds.Height;
+                if (right <= static_cast<double>(tray_rc.left) ||
+                    static_cast<double>(bounds.X) >= static_cast<double>(tray_rc.right) ||
+                    bottom <= static_cast<double>(tray_rc.top) ||
+                    static_cast<double>(bounds.Y) >= static_cast<double>(tray_rc.bottom))
+                    return 3;
+            }
+        }
+    }
+    catch (...)
+    {
+    }
+    return 0;
+}
+
+//量一次小组件的右边界并记账（它自己的事件、它祖先的事件、和它自己走到 Arrange，三条路都走这里）。
+//量得到就报；量不到按 WidgetsGoneReason 的几条判据决定"抹掉那一格"还是"维持上一次的值"。
+//fallback_edge_dip 是排版矩形算出来的边界（只有 Arrange 那一路有；事件里传 0 = 不去猜）。
+static void RepublishWidgetsEdge(FrameworkElement const& element, double fallback_edge_dip)
 {
     if (!g_enabled_cache.load())
         return;
     RecordWidgetsState(element);
     bool visible = true;
-    const double edge = VisibleRightEdgeDip(element, 0.0, &visible);
-    if (visible && edge > 0.0)
+    const double edge = VisibleRightEdgeDip(element, fallback_edge_dip, &visible);
+    const bool measured = (visible && edge > 0.0);
+    const int reason = measured ? 0 : WidgetsGoneReason(element);
+    const int last_reason = g_widgets_gone_reason.exchange(reason);
+
+    if (measured)
         UpdateBlockEnd(SystemButton::Widgets, edge);
-    else if (WidgetsGone(element))
+    else if (reason != 0)
         ClearBlockEnd(SystemButton::Widgets);
+
+    //判据结论变了、块宽却没变（那一格本来就是 0，抹不抹出来的数一样）：
+    //上面两条路都不会写注册表，why= 就出不来，只能靠"没变化"去猜。这里补发一行。
+    if (last_reason != reason)
+        PublishEdges();
 }
 
-//小组件事件的统一处理：记一笔 ev、按类型补账，然后无条件发一行现场。
+//小组件事件的统一处理：记一笔 ev、按类型补账，然后（元素自己那一路）无条件发一行现场。
 //为什么"无条件发"：只有 ev 变了才保证注册表被动一次，这样"我按了开关但什么都没发生"
 //在注册表里是看得见的（那一行不动），而不是只能靠"数字没变"去猜。
-static void OnWidgetsEvent(winrt::weak_ref<FrameworkElement> const& weak, bool unloaded)
+//为什么祖先那一路不无条件发：祖先（往上好几层，最外面就是整条任务栏）的尺寸变化很频繁，
+//每来一次就写一次注册表 = 每来一次就把插件从 RegNotifyChangeKeyValue 上叫醒一遍，
+//那是拿任务栏的日常抖动去骚扰另一个进程。祖先事件照样量、照样判，
+//只有真的量出变化（那一格的边界变了 / 判据结论变了）才写盘 —— 该叫得动的时候一定叫得动。
+//OnWidgetsEvent 最后一个参数的两种取法（写在调用处比裸 true/false 好读）：
+static constexpr bool kForceLine = true;      //元素自己的事件：无条件发一行现场（他按开关就看这一行动没动）
+static constexpr bool kQuietLine = false;     //祖先的事件：只在真量出变化时发（任务栏天天在改尺寸，别拿它吵醒插件）
+static void OnWidgetsEvent(winrt::weak_ref<FrameworkElement> const& weak, bool unloaded, bool announce)
 {
     g_widgets_event_count.fetch_add(1, std::memory_order_relaxed);
     try
@@ -694,15 +806,76 @@ static void OnWidgetsEvent(winrt::weak_ref<FrameworkElement> const& weak, bool u
         auto element = weak.get();
         if (!element)
             return;
+        //只认"当前在跟的那个元素"：按钮换了实例（任务栏重建）以后，旧元素身上和它祖先身上
+        //挂着的旧处理器还会晚点到几次 —— 让旧元素那身过时现场去量、去抹那一格，比不量还糟。
+        if (g_widgets_watched_abi != nullptr && winrt::get_abi(element) != g_widgets_watched_abi)
+            return;
         if (unloaded)
-            ClearBlockEnd(SystemButton::Widgets);       //元素从树上摘掉了，那一格不能留
+        {
+            g_widgets_gone_reason = 5;                  //5 = 元素整个从树上摘掉了，不用再问可见性
+            ClearBlockEnd(SystemButton::Widgets);       //那一格不能留
+        }
         else
-            RepublishWidgetsEdge(element);
+            RepublishWidgetsEdge(element, 0.0);
     }
     catch (...)
     {
     }
-    PublishEdges();
+    if (announce)
+        PublishEdges();
+}
+
+//给小组件的祖先链订一次"尺寸变了"。为什么非得订外层（这是这一版的关键）：
+//元素自己的三个事件只能覆盖"它自己变了"，可实测关掉小组件后它自己那身现场一动不动
+//（vis 还是 0=Visible、aw 还是 21600），缩起来的是外面某一层 —— 那一层缩到 0 尺寸，
+//元素这边什么都听不到，于是块宽一直挂着"开着"的 291，TM 就贴不回多任务视图右边。
+//只订 SizeChanged 这一件事：折叠、被排成 0 宽、被撑回去，任何一种都必然路过它；
+//可见性变化在 UWP 上没有事件可订，但改可见性一定改尺寸，效果一样（不用定时器）。
+//处理函数拿的还是"元素自己"的弱引用：外面哪一层变了都不要紧，要量的始终是小组件的右边界。
+static void WatchWidgetsAncestors(FrameworkElement const& element)
+{
+    auto parent = xaml_media::VisualTreeHelper::GetParent(element).try_as<FrameworkElement>();
+    if (!parent)
+        return;
+
+    void* parent_abi = winrt::get_abi(parent);
+    if (g_widgets_watched_up_abi == parent_abi && !g_widgets_watched_up.empty())
+    {
+        try
+        {
+            auto alive = g_widgets_watched_up[0].get();
+            if (alive && winrt::get_abi(alive) == parent_abi)
+                return;         //还是那个父亲，已经订过了
+        }
+        catch (...)
+        {
+        }
+    }
+
+    g_widgets_watched_up_abi = nullptr;
+    g_widgets_watched_up.clear();
+    try
+    {
+        winrt::weak_ref<FrameworkElement> weak{ element };
+        auto current = element;
+        for (int depth = 0; depth < kWidgetsAncestorWalk; depth++)
+        {
+            auto up = xaml_media::VisualTreeHelper::GetParent(current).try_as<FrameworkElement>();
+            if (!up)
+                break;
+            if (depth == 0)
+                g_widgets_watched_up.emplace_back(up);        //父亲留一份弱引用，当作"订过了"的凭据
+            up.SizeChanged([weak](auto&&, auto&&) { OnWidgetsEvent(weak, false, kQuietLine); });
+            current = up;
+        }
+        if (!g_widgets_watched_up.empty())
+            g_widgets_watched_up_abi = parent_abi;
+    }
+    catch (...)
+    {
+        g_widgets_watched_up_abi = nullptr;
+        g_widgets_watched_up.clear();
+    }
 }
 
 //给小组件按钮订一次它自己的事件。为什么非得订：块宽过去只在"有按钮走到 Arrange"时才重新记账，
@@ -715,7 +888,8 @@ static void OnWidgetsEvent(winrt::weak_ref<FrameworkElement> const& weak, bool u
 //  Unloaded —— 元素被摘掉：那一格必须清零；
 //  Loaded —— 元素又挂回来（重新打开小组件 / 任务栏重建）：先量一次，量不到也还有下面的 SizeChanged；
 //  SizeChanged —— 尺寸刚落定（出现动画走完、天气文字变长变短、被折叠成 0）：重量一次。
-static void WatchWidgetsEvents(FrameworkElement const& element)
+//返回"这一轮真的重订了"（true）：祖先那一路只在换实例的时候跟着重订一次，理由见 WatchWidgetsEvents。
+static bool WatchWidgetsSelf(FrameworkElement const& element)
 {
     void* abi = winrt::get_abi(element);
 
@@ -728,7 +902,7 @@ static void WatchWidgetsEvents(FrameworkElement const& element)
         {
             auto alive = g_widgets_watched[0].get();
             if (alive && winrt::get_abi(alive) == abi)
-                return;
+                return false;
         }
         catch (...)
         {
@@ -737,29 +911,53 @@ static void WatchWidgetsEvents(FrameworkElement const& element)
 
     g_widgets_watched_abi = nullptr;
     g_widgets_watched.clear();
+    //元素换了实例，祖先那一路的记账一起作废：那批处理器手里攥的是旧元素的弱引用，
+    //不清掉这道闸，同一父亲就直接早退、新元素永远无人叫醒。
+    g_widgets_watched_up_abi = nullptr;
+    g_widgets_watched_up.clear();
     try
     {
         //弱引用：元素被回收就自动失效，不能让它为了听事件而永远活着
         winrt::weak_ref<FrameworkElement> weak{ element };
 
         //摘掉（小组件在设置里关掉，这个按钮就从树上消失了）：那一格必须清零
-        element.Unloaded([weak](auto&&, auto&&) { OnWidgetsEvent(weak, true); });
+        element.Unloaded([weak](auto&&, auto&&) { OnWidgetsEvent(weak, true, kForceLine); });
 
         //挂回来（重新打开小组件、任务栏重建）：出现动画这一步可能还量不到，
         //但紧接着一定会有 SizeChanged，那里再量一次
-        element.Loaded([weak](auto&&, auto&&) { OnWidgetsEvent(weak, false); });
+        element.Loaded([weak](auto&&, auto&&) { OnWidgetsEvent(weak, false, kForceLine); });
 
         //刚落定一次尺寸（出现动画走完、天气文字变长变短、整组折叠成 0）：重量一次
-        element.SizeChanged([weak](auto&&, auto&&) { OnWidgetsEvent(weak, false); });
+        element.SizeChanged([weak](auto&&, auto&&) { OnWidgetsEvent(weak, false, kForceLine); });
 
         //三个都订上了才记账：半途抛了就当作没订，下一轮排版重来
         g_widgets_watched.emplace_back(element);
         g_widgets_watched_abi = abi;
+        return true;
     }
     catch (...)
     {
         g_widgets_watched_abi = nullptr;
         g_widgets_watched.clear();
+        return false;
+    }
+}
+
+//把"元素自己"和"它的祖先链"两层订阅串起来。
+//为什么祖先那一路跟着"元素换实例"走，而不是每轮排版都查一遍父亲：
+//Arrange 每轮都进来，一旦父亲那个身份判定哪天对不上（同一个原生元素被投影成两个包装对象之类），
+//每轮就白订 12 个处理器 —— 任务栏按钮的处理器只增不减，那是个越滚越大的漏。
+//而祖先本来就只有在新实例出现时才需要重订，元素这一层已经把那个时机报得准准的了。
+static void WatchWidgetsEvents(FrameworkElement const& element)
+{
+    if (!WatchWidgetsSelf(element))
+        return;
+    try
+    {
+        WatchWidgetsAncestors(element);
+    }
+    catch (...)
+    {
     }
 }
 
@@ -814,16 +1012,10 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
                     if (ForgetAbsentButtons(children))
                         PublishBlockFromSlots();
                 }
-                bool visible = true;
-                RecordWidgetsState(element);
-                const double edge = VisibleRightEdgeDip(element, rect.X + rect.Width, &visible);
-                if (visible)
-                    UpdateBlockEnd(SystemButton::Widgets, edge);
-                else if (WidgetsGone(element))
-                    ClearBlockEnd(SystemButton::Widgets);      //可见性说折叠了：元素还在树上，但不占位了
-                //visible==false 而可见性还是 Visible：这是出现动画的中间态（元素说要画、peer 还没给出边界）。
-                //这时候绝不能把那一格抹成 0 —— 抹了就是"小组件开着、块宽却按没开算"，TM 直接压上去。
-                //留着旧值，等它自己的 Loaded / SizeChanged 来重量一遍。
+                //量 + 判 + 记账全走 RepublishWidgetsEdge（和它自己的事件、祖先的事件同一条路，
+                //省得两处判据以后各改各的）。这里把排版矩形交进去当兜底：
+                //UIA 拿不到边界时才用它，拿得到的一律用"看得见的边界"。
+                RepublishWidgetsEdge(element, static_cast<double>(rect.X) + rect.Width);
             }
             else
                 ClearBlockEnd(SystemButton::Widgets);

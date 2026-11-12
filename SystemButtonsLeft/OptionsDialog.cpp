@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-10 19:09:21 +08:00
+// Last Modified At: 2026-11-12 10:55:15 +08:00
 #include "framework.h"
 #include <cstdio>
 #include <cwchar>
@@ -93,7 +93,10 @@ static void RefreshStatusLines(HWND hDlg)
     //          其中 sy= 是本体回调（OnMonitorInfo）跑过几次，0 就说明这个宿主根本不通知插件，
     //          跟手这件事全靠注册表变化叫醒的 ApplyNow；ap= 是插件主动搬窗口的次数，
     //          x=旧->新 是最后一次搬运的两端（搬之前在哪 / 算出来该在哪）。
-    //  第 8 行：助手看到的四个按钮各自的右边界（块宽取其中最大的一个）。
+    //  第 8 行：助手看到的四个按钮各自的右边界（块宽取其中最大的一个），
+    //          后面还跟着小组件那一格的现场（ev/vis/aw/why/pv/pw，含义见 SplitContract.h）。
+    //          界面这一行宽只有约 55 字，尾巴会被截掉 —— 要看全的一律
+    //          reg query HKCU\Software\TrafficMonitor /v TaskbarSplitEdges。
     ::swprintf_s(buf, L"诊断（%d）：%s", st.helper_step, HelperStepText(st.helper_step));
     SetStatusLine(hDlg, IDC_STATUS_LINE6, buf);
 
@@ -104,7 +107,10 @@ static void RefreshStatusLines(HWND hDlg)
         ::swprintf_s(buf, L"窗口跟随：还没挂上（任务栏窗口打开后本体下一次刷新就挂）");
     SetStatusLine(hDlg, IDC_STATUS_LINE7, buf);
 
-    wchar_t edges[128]{};
+    //224 个 wchar：助手那一行加到 why=/pv=/pw= 以后最长约 110 字符，128 看着够，
+    //但 n= 那几个计数涨到四位数就顶边了 —— 读不下时 SplitRegReadString 直接失败，
+    //界面显示"助手还没报上来"，那是假象（助手明明在报），害人多猜一轮。
+    wchar_t edges[224]{};
     if (SplitRegReadString(kRegEdges, edges, sizeof(edges) / sizeof(edges[0])) && edges[0] != L'\0')
         ::swprintf_s(buf, L"按钮右边界：%s", edges);
     else

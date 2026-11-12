@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-11 18:31:35 +08:00
+// Last Modified At: 2026-11-12 10:55:15 +08:00
 #pragma once
 #include <windows.h>
 
@@ -31,7 +31,10 @@ static constexpr const wchar_t* kRegActive = L"TaskbarSplitActive";     //REG_DW
 static constexpr const wchar_t* kRegPid = L"TaskbarSplitPid";           //REG_DWORD 助手所在进程（explorer）的ID
 static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的右边界，单位 1/100 DIP（= 最右边那个按钮排版矩形的 X+Width，TM 任务栏窗口就紧跟在这条线后面）
 static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ 调试信息：助手在任务栏上看到的控件类型名
-static constexpr const wchar_t* kRegEdges = L"TaskbarSplitEdges";       //REG_SZ 助手报的现场四格：s=/se=/tv=/w= 每个按钮看得见的右边界(1/100 DIP)，src=uia|rect 这些数是 UIA 边界还是退回排版矩形，n=开始/搜索/视图/小组件各自累计经过挂钩几次，ev=小组件按钮自己的事件进来了几次，vis=小组件元素的可见性(0=Visible 1=Collapsed 2=Hidden -1=还没量过)，aw=它的 ActualWidth(1/100 DIP)。
+static constexpr const wchar_t* kRegEdges = L"TaskbarSplitEdges";       //REG_SZ 助手报的现场四格：s=/se=/tv=/w= 每个按钮看得见的右边界(1/100 DIP)，src=uia|rect 这些数是 UIA 边界还是退回排版矩形，n=开始/搜索/视图/小组件各自累计经过挂钩几次，ev=小组件那格的事件（它自己的 Unloaded/Loaded/SizeChanged + 祖先链的 SizeChanged）进来了几次，vis=小组件元素的可见性(0=Visible 1=Collapsed 2=Hidden -1=还没量过)，aw=它的 ActualWidth(1/100 DIP)，
+                                                                        //why=「这一格该不该抹掉」最终采纳的判据（1=它自己没 Visible；2=某层祖先被折叠；3=边界非空但整个在任务栏外；4=祖先写着 Visible 却被排成 0 尺寸；5=元素被从树上摘掉；0=判不出来所以维持上一次的值；-1=还没判过），
+                                                                        //pv=/pw= 直系父亲的可见性和 ActualWidth(1/100 DIP)：why=0 就看这两个数，父亲还是满宽说明收起来那层不在父亲身上。
+                                                                        //这一行是"开关小组件后 TM 贴不贴得回去"的唯一现场：ev 不涨=压根没被叫醒；ev 涨了 why 还是 0=眼神不对（判据得加一条）。
                                                                         //块宽只有一个数，"某个按钮没报上来"和"某个按钮报大了"看着一样，靠这四格一次分清；开关小组件后这一行动不动，分的又是"事件没来"和"来了没量到"。
 static constexpr const wchar_t* kRegBuild = L"TaskbarSplitBuild";       //REG_SZ 助手 DLL 的编译时间戳。
                                                                         //explorer 里可能还挂着上一版的镜像（文件换了、进程没换），看这一行就知道正在跑的到底是哪一版
