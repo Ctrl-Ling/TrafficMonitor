@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 15:23:03 +08:00
+// Last Modified At: 2026-11-12 18:31:00 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -810,6 +810,7 @@ static double g_app_sweep_max_dip{ 0.0 };      //这一趟里最右的 X+宽
 static double g_app_sweep_last_pos_dip{ 0.0 }; //这一趟上一个按钮的位置（用来认"是不是重新开始了一趟"）
 static int g_app_sweep_count{ 0 };
 static bool g_app_sweep_open{ false };         //这一趟已经开始记了没有
+static bool g_app_sweep_vertical{ false };     //这一趟记的是哪条轴（轴一变，上一趟的数就全废了）
 //上一趟交出来的整组位置：偏移用的就是这两个数。
 static double g_app_group_left_dip{ 0.0 };
 static double g_app_group_right_dip{ 0.0 };
@@ -817,6 +818,7 @@ static int g_app_group_count{ 0 };
 static long g_app_group_match{ 0 };            //一共命中过几次白名单（0 = 这个系统上应用按钮不叫这个名字）
 static double g_app_group_delta_dip{ 0.0 };    //最后一次真正加上去的偏移
 static bool g_app_group_vertical{ false };     //最后一次量到的轴向（诊断里写出来，别让人猜）
+static double g_app_group_limit_dip{ 0.0 };    //这一组排完还剩多少可挪的余量（面板边到最右沿），偏移被它卡住时 lim 就是负数/0
 
 static bool IsAppIconButton(std::wstring const& class_name)
 {
@@ -832,18 +834,21 @@ static bool IsAppIconButton(std::wstring const& class_name)
 //而"居中没居中"是他一眼就能看出来的毛病，需要一行专门的答案：
 //match=0 是名字不对（下一步照 Classes 改名单），n=1 是只有一个窗口（那本来就没得居中），
 //d=0 是算出来是负的（组太宽，故意不挪），d 正常但屏幕上没动才是"delta 没落到元素上"。
+//lim= 是"这一趟真实排到的最右沿到面板边还剩多少"：d 被 lim 卡住（d≈lim 或 lim<=0）就说明
+//这一组比上一趟宽、正在往外冒，那一帧挤一下是故意的，飞出任务栏（图标整排看不见）才是事故。
 static void PublishAppGroup(double panel_dip)
 {
     if (g_app_group_match == 0)
         return;     //一个都没命中：别写一行全是 0 的数骗人去看，Classes 那行才是这一轮的正确答案
 
     wchar_t buf[192]{};
-    ::swprintf_s(buf, L"n=%d left=%d width=%d panel=%d d=%d axis=%s",
+    ::swprintf_s(buf, L"n=%d left=%d width=%d panel=%d d=%d lim=%d axis=%s",
         g_app_group_count,
         static_cast<int>(std::lround(g_app_group_left_dip * 100.0)),
         static_cast<int>(std::lround((g_app_group_right_dip - g_app_group_left_dip) * 100.0)),
         static_cast<int>(std::lround(panel_dip * 100.0)),
         static_cast<int>(std::lround(g_app_group_delta_dip * 100.0)),
+        static_cast<int>(std::lround(g_app_group_limit_dip * 100.0)),
         g_app_group_vertical ? L"v" : L"h");
 
     //拼好的串和上次一模一样就不进注册表：SplitRegWriteStringIfChanged 是"每次调用都开一次键查一遍"，
@@ -890,6 +895,18 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
     const double size = vertical ? static_cast<double>(rect.Height) : static_cast<double>(rect.Width);
     *out_panel = panel_dip;
 
+    //轴一变（任务栏从下边拖到左边/右边），上一趟记的 min/max 就是另一条轴上的数，
+    //拿屏幕高度去推横向偏移，能把整组推到看不见的位置上。
+    //所以轴一变就作废上一趟的记账：这一趟不挪，下一趟重新攒出来的宽度才有偏移。
+    if (g_app_sweep_open && g_app_sweep_vertical != vertical)
+    {
+        g_app_sweep_open = false;
+        g_app_sweep_count = 0;
+        g_app_group_left_dip = 0.0;
+        g_app_group_right_dip = 0.0;
+        g_app_group_count = 0;
+    }
+
     if (!g_app_sweep_open || pos <= g_app_sweep_last_pos_dip)
     {
         //新一趟开始：先把上一趟的结果交出来当这一趟的偏移依据。
@@ -907,6 +924,7 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
         g_app_sweep_max_dip = pos + size;
         g_app_sweep_count = 1;
         g_app_sweep_open = true;
+        g_app_sweep_vertical = vertical;
     }
     else
     {
@@ -928,6 +946,18 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
         if (delta < 0.0)
             delta = 0.0;      //宽到放不下：维持系统的排法，不把应用图标拖回按钮块上
     }
+
+    //最后一道保险——"应用图标整排忽然没了"缺的就是这一道。
+    //偏移是按上一趟的整组宽度算的：新开一个应用（或把窗口拖成第二个按钮）时，
+    //这一趟比上一趟宽，照旧宽度折半，最右边那几个的 X+宽 就越过任务栏那头去了，
+    //XAML 把它们排在面板外面，屏幕上看到的就是"图标消失一片"。
+    //这里拿"当前这一趟已经排到的最右沿"当场卡住：越不过面板边。
+    //上限只会随按钮逐个排过来越收越紧，不会一帧松一帧紧，所以不会来回摆。
+    //代价是那一帧右边几个按钮挤得近一点（宁可挤，不许飞出屏），下一趟宽度补齐就正了。
+    const double limit = panel_dip - g_app_sweep_max_dip;
+    if (delta > limit)
+        delta = (limit > 0.0) ? limit : 0.0;
+    g_app_group_limit_dip = limit;
     g_app_group_delta_dip = delta;
     PublishAppGroup(panel_dip);
 
@@ -954,10 +984,12 @@ static void ResetAppGroupAccounting()
     g_app_sweep_last_pos_dip = 0.0;
     g_app_sweep_count = 0;
     g_app_sweep_open = false;
+    g_app_sweep_vertical = false;
     g_app_group_left_dip = 0.0;
     g_app_group_right_dip = 0.0;
     g_app_group_count = 0;
     g_app_group_delta_dip = 0.0;
+    g_app_group_limit_dip = 0.0;
 }
 
 //四个按钮各自报上来的右边沿，一行写清楚。为什么要这一行：块宽只有一个数，

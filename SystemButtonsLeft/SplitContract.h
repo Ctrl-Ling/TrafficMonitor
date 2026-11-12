@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 14:24:23 +08:00
+// Last Modified At: 2026-11-12 18:31:00 +08:00
 #pragma once
 #include <windows.h>
 
@@ -38,11 +38,14 @@ static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ
 // 助手 -> 插件：下面这一个是方案 B 新加的（居中的那一刀下在应用图标组身上）
 //应用图标那一组"整组居中"的现场（方案 B 剩下的唯一一件系统自己做不到的事）。
 //偏移 = (panel - width)/2 - left，同一个偏移加在这一组每个按钮转发的矩形上，所以组内间距还是系统排的那份。
-//n=上一趟这一组有几个按钮，left=整组左沿(1/100 DIP，相对任务栏左沿)，width=整组宽，panel=折半对着的那个数（任务栏窗口的宽，竖排时是高），d=最后一次真正加上去的偏移，axis=h|v。
+//n=上一趟这一组有几个按钮，left=整组左沿(1/100 DIP，相对任务栏左沿)，width=整组宽，panel=折半对着的那个数（任务栏窗口的宽，竖排时是高），d=最后一次真正加上去的偏移，lim=这一趟真实排到的最右沿到面板边还剩多少余量，axis=h|v。
 //怎么读：压根没有这一行 = 白名单一个都没命中，别猜，去看 TaskbarSplitClasses，那一行才是"应用按钮到底叫什么"的答案；
 //n=1 = 只开着一个窗口，本来就没有"组"可居中；width 明显比屏幕上那一排窄 = 有按钮没被算进来，居中一定偏；
 //d=0 = 算出来是 0 或负数（这一组宽到放不下，故意不挪，维持系统的排法，宁可不齐也别叠到小组件上）；
+//d≈lim 或 lim<=0 = 这一组比上一趟宽、正往外冒，偏移被面板边卡住了：那一帧右边几个按钮挤近一点是故意的，
+//                  不卡就会把最右边那几个排到任务栏外面，屏幕上看到的就是"应用图标整排消失"（下一趟宽度补齐就正了）；
 //d 正常但屏幕上没动 = 偏移没落到元素上，回头查 Arrange 转发矩形那一条路。
+//axis 一变（任务栏拖到侧边）上一趟的记账当场作废、这一趟不挪，所以那一趟看到 d=0 是正常的，不是算错。
 //为什么单独一行不塞进 TaskbarSplitEdges：Edges 已经被四格 + 小组件判据占满，而"居中没居中"是一眼就能看出来的毛病，值得一行专门的答案。
 static constexpr const wchar_t* kRegAppGroup = L"TaskbarSplitAppGroup";   //REG_SZ 见上面那段
 static constexpr const wchar_t* kRegEdges = L"TaskbarSplitEdges";       //REG_SZ 助手报的现场四格：s=/se=/tv=/w= 每个按钮看得见的右边界(1/100 DIP)，src=uia|rect 这些数是 UIA 边界还是退回排版矩形，n=开始/搜索/视图/小组件各自累计经过挂钩几次，ev=小组件那格的事件（它自己的 Unloaded/Loaded/SizeChanged + 祖先链的 SizeChanged）进来了几次，vis=小组件元素的可见性(0=Visible 1=Collapsed 2=Hidden -1=还没量过)，aw=它的 ActualWidth(1/100 DIP)，
