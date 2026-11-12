@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 12:01:10 +08:00
+// Last Modified At: 2026-11-12 14:13:15 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -123,6 +123,28 @@ static std::vector<winrt::weak_ref<FrameworkElement>> g_widgets_watched_up;
 static constexpr int kWidgetsAncestorWalk = 12;
 static thread_local bool g_in_hook{ false };
 
+//【片4 · 先认名字，再谈居中】把"不是那四个系统按钮"的控件类型名报出来。
+//为什么必须先报名字：B 路线剩下的唯一一件事就是把应用图标那一组整组居中，
+//而下这一刀之前必须知道三件事 —— 应用按钮的类名、它父亲是谁、排版器把它摆在 x=几、宽 w=几。
+//这三个数一个都猜不得：猜错类名，偏移会打在托盘时钟/网络图标或者一堆 Grid 上，任务栏直接排坏。
+//只收 Taskbar. 开头的那一族：任务栏自己的控件（应用图标、托盘、飞岛宿主）全在这一族里，
+//而排版器每帧还要过成百上千个 Grid/Border/TextBlock，收进来只会把有用名字挤出限额。
+//探测有预算：每过一次就扣一格，扣完就再也不问类型名（get_class_name 是一次 WinRT 调用，
+//不该在 Arrange 这种每帧几十次的热路径上长期背着）。该看到的名字在头几帧就都看到了。
+struct ClassNameRecord
+{
+    std::wstring name;
+    std::wstring parent;
+    long count{ 0 };
+    int x_100{ 0 };
+    int w_100{ 0 };
+};
+static constexpr size_t kClassNameMax = 12;
+static constexpr long kClassNameProbeBudget = 20000;
+static std::atomic<long> g_class_probe_budget{ kClassNameProbeBudget };
+static std::mutex g_class_mutex;
+static std::vector<ClassNameRecord> g_class_records;      //顺序 = 第一次出现的顺序
+
 //explorer 不重启的话，磁盘上换了新 dll，进程里可能还是旧镜像（旧代码在跑、新文件在盘上）。
 //这样注册表里那个块宽到底是"新算法算错了"还是"根本没跑到新代码"，看一眼就分得清。
 static void WriteBuildStamp()
@@ -146,6 +168,7 @@ static void ReportWorkingOnce()
     SplitRegWriteDwordIfChanged(kRegPid, ::GetCurrentProcessId());
     SplitRegWriteDwordIfChanged(kRegStep, kStepPinning);
     WriteBuildStamp();
+    PublishClasses();       //此刻报名字：让"应用图标那一组叫什么"这一行在挂钩刚证明自己能跑时就存在
 }
 
 //被我们动过边距的按钮，禁用时要一个个还原回去（用弱引用，元素被回收就自动失效）
@@ -154,6 +177,8 @@ static std::vector<winrt::weak_ref<FrameworkElement>> g_touched_elements;
 
 static SystemButton IdentifySystemButton(FrameworkElement const& element);
 static bool IsPinnedClusterButton(SystemButton button);
+static bool RecordClassName(FrameworkElement const& element, Rect rect);
+static void PublishClasses();
 static void UpdateClusterCollapse(FrameworkElement const& element, bool enabled);
 static void UpdateWidgetsPosition(FrameworkElement const& element, bool enabled);
 static void PostToTaskbarThread(FrameworkElement const& element,
@@ -754,6 +779,91 @@ static VisibleSpan VisibleSpanDip(FrameworkElement const& element, double fallba
     span.ok = true;
     span.right = fallback_edge_dip;
     return span;
+}
+
+//【片4】记下一个"不是那四个系统按钮"的控件类型名，第一次见到就报一行。
+//返回 true 只在"这一趟第一次见到这个名字"时成立：名字集合一旦稳定，这一行就不再重写，
+//省得把每帧排版变成一次跨进程写盘（注册表写一次就会叫醒一次监视它的插件，那是白烧 CPU）。
+//x=/w= 收的是排版器这一次给它的位置和宽度（1/100 DIP，相对任务栏左沿）：
+//应用图标在 x 中间一段、托盘图标在 x 右端、飞岛宿主宽会顶到屏幕边，一列看下来谁是谁不用猜。
+//p= 是直系父亲的类名：居中这一刀要么下在每个应用按钮自己身上、要么下在它们共同的那个容器上，
+//父亲是谁决定哪一种成立，所以这个数必须和名字一起拿到。
+static bool RecordClassName(FrameworkElement const& element, Rect rect)
+{
+    if (g_class_probe_budget.fetch_sub(1, std::memory_order_relaxed) <= 0)
+        return false;
+
+    std::wstring name;
+    try
+    {
+        name = get_class_name(element);
+    }
+    catch (...)
+    {
+        return false;
+    }
+    if (name.rfind(L"Taskbar.", 0) != 0)
+        return false;
+
+    ClassNameRecord record;
+    record.name = name;
+    try
+    {
+        auto parent = xaml_media::VisualTreeHelper::GetParent(element).try_as<FrameworkElement>();
+        if (parent)
+            record.parent = get_class_name(parent);
+    }
+    catch (...)
+    {
+    }
+    RECT tray_rc{};
+    UINT tray_dpi = 96;
+    const bool have_frame = TrayFrame(&tray_rc, &tray_dpi);
+    const double scale = 96.0 / tray_dpi;
+    record.x_100 = have_frame
+        ? static_cast<int>(std::lround((static_cast<double>(rect.X) - tray_rc.left) * scale * 100.0))
+        : static_cast<int>(std::lround(rect.X * 100.0));
+    record.w_100 = static_cast<int>(std::lround(static_cast<double>(rect.Width) * 100.0));
+    record.count = 1;
+
+    std::lock_guard<std::mutex> lock(g_class_mutex);
+    for (auto& item : g_class_records)
+    {
+        if (item.name == name)
+        {
+            item.count++;
+            return false;
+        }
+    }
+    if (g_class_records.size() >= kClassNameMax)
+        return false;
+    g_class_records.push_back(record);
+    return true;
+}
+
+//把上面那张名字表拼成一行写进注册表。ID 只在第一次见到时留一次现场，
+//所以这一行是给"下一轮编译前先看注册表"用的证据，不是运行时要读的东西。
+static void PublishClasses()
+{
+    wchar_t buf[1024]{};
+    int used = 0;
+
+    std::lock_guard<std::mutex> lock(g_class_mutex);
+    used = ::swprintf_s(buf, L"n=%d", static_cast<int>(g_class_records.size()));
+    if (used < 0)
+        return;
+    for (auto& item : g_class_records)
+    {
+        if (used > 860)
+            break;
+        const int added = ::swprintf_s(buf + used, L" | %s c=%d x=%d w=%d p=%s",
+            item.name.c_str(), static_cast<int>(item.count), item.x_100, item.w_100,
+            item.parent.empty() ? L"?" : item.parent.c_str());
+        if (added < 0)
+            break;
+        used += added;
+    }
+    SplitRegWriteStringIfChanged(kRegClasses, buf);
 }
 
 //四个按钮各自报上来的右边沿，一行写清楚。为什么要这一行：块宽只有一个数，
@@ -1362,7 +1472,13 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
         }
 
         if (!IsPinnedClusterButton(button))
-            return g_arrange_original(p_this, rect);     //应用图标等一律不动
+        {
+            //不是那四个系统按钮的一切（应用图标、托盘、外壳自己的容器）：
+            //先把类型名报上去，让"居中该下在哪个元素上"这件事用一行注册表回答，别靠猜（见 RecordClassName）。
+            if (button == SystemButton::None && RecordClassName(element, rect))
+                PublishClasses();
+            return g_arrange_original(p_this, rect);
+        }
 
         ReportWorkingOnce();
         RememberTouched(element);

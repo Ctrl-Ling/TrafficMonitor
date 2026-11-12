@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 12:01:10 +08:00
+// Last Modified At: 2026-11-12 14:13:15 +08:00
 #pragma once
 #include <windows.h>
 
@@ -30,7 +30,11 @@ static constexpr const wchar_t* kRegAckSeq = L"TaskbarSplitAckSeq";     //REG_DW
 static constexpr const wchar_t* kRegActive = L"TaskbarSplitActive";     //REG_DWORD 1：助手已在当前 explorer.exe 里挂钩成功
 static constexpr const wchar_t* kRegPid = L"TaskbarSplitPid";           //REG_DWORD 助手所在进程（explorer）的ID
 static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的右边界，单位 1/100 DIP（= 四格里最右边那格的"看得见"右边界，不是排版矩形——排版矩形和屏幕上那块差一两个按钮位，TM 任务栏窗口就紧跟在这条线后面）
-static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ 调试信息：助手在任务栏上看到的控件类型名
+static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ 助手看到的"不是那四个系统按钮"的控件类型名，格式：
+                                                                        //n=<几个> | 类名 c=<经过Arrange几次> x=<排版器给它的X(1/100 DIP，相对任务栏左沿)> w=<宽(1/100 DIP)> p=<直系父亲的类名>
+                                                                        //只收 Taskbar. 开头的那一族（应用图标/托盘/飞岛宿主都在这一族），每个名字只在第一次见到时写一行，之后这一行不再动。
+                                                                        //这一行专门用来回答"应用图标那一组叫什么、住在谁的容器里"：居中的偏移要下在每个应用按钮身上还是下在它们共同的父亲身上，
+                                                                        //看 p= 就知道；名字猜错的代价是偏移打在托盘时钟上、任务栏直接排坏，所以先读这一行再动代码。
 static constexpr const wchar_t* kRegEdges = L"TaskbarSplitEdges";       //REG_SZ 助手报的现场四格：s=/se=/tv=/w= 每个按钮看得见的右边界(1/100 DIP)，src=uia|rect 这些数是 UIA 边界还是退回排版矩形，n=开始/搜索/视图/小组件各自累计经过挂钩几次，ev=小组件那格的事件（它自己的 Unloaded/Loaded/SizeChanged + 祖先链的 SizeChanged）进来了几次，vis=小组件元素的可见性(0=Visible 1=Collapsed 2=Hidden -1=还没量过)，aw=它的 ActualWidth(1/100 DIP)，
                                                                         //why=「这一格该不该抹掉」最终采纳的判据（6=元素已不在活树上(IsLoaded=false)；1=它自己没 Visible；2=某层祖先被折叠；3=边界非空但整个在任务栏外；4=祖先写着 Visible 却被排成 0 尺寸；5=元素被从树上摘掉；0=判不出来所以维持上一次的值；-1=还没判过），
                                                                         //pv=/pw= 直系父亲的可见性和 ActualWidth(1/100 DIP)：why=0 就看这两个数，父亲还是满宽说明收起来那层不在父亲身上。ld= IsLoaded(1/0/-1 问不出来)，ms= 这一轮到底量到了没有(1/0)——ms 把 why=0 的两种意思分开：量到了 vs 判不出来。
