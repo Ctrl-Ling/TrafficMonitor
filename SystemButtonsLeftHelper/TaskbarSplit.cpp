@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 14:17:42 +08:00
+// Last Modified At: 2026-11-12 14:24:23 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -189,6 +189,7 @@ static SystemButton IdentifySystemButton(FrameworkElement const& element);
 static bool IsPinnedClusterButton(SystemButton button);
 static bool RecordClassName(FrameworkElement const& element, Rect rect);
 static void PublishClasses();
+static void ResetAppGroupAccounting();
 static void ClearStaleClusterMargin(FrameworkElement const& element);
 static void ClearStaleWidgetsOffset(FrameworkElement const& element);
 static void PostToTaskbarThread(FrameworkElement const& element,
@@ -268,6 +269,7 @@ void RestoreMarginsAsync()
         left = 0.0;
     g_last_published_dip = -1.0;
     g_edge_from_uia = false;
+    ResetAppGroupAccounting();      //片5：应用图标居中的记账一起清零（偏移本身写在转发矩形里，关掉就没了）
     SplitRegWriteDwordIfChanged(kRegBlock, 0u);
 }
 
@@ -311,13 +313,6 @@ static SystemButton IdentifySystemButton(FrameworkElement const& element)
     {
     }
     return SystemButton::None;
-}
-
-//任务栏是不是竖着摆的（贴在屏幕左右两侧）。居中标本删掉之后这条暂时没人用了，
-//但 B 路线剩下的那一刀（应用图标整组居中）必须分横竖两路算：横排要比屏幕宽折半，竖排要比屏幕高折半。
-static bool IsVerticalTaskbar(FrameworkElement const& frame)
-{
-    return frame.ActualHeight() > frame.ActualWidth();
 }
 
 //递归找出某个容器下面所有系统按钮（不依赖 ItemsRepeater 的投影类型，那套头文件不在 Windows SDK 里）
@@ -779,6 +774,185 @@ static void PublishClasses()
         used += added;
     }
     SplitRegWriteStringIfChanged(kRegClasses, buf);
+}
+
+//【片3 · 把应用图标那一组整组居中】方案 B 剩下的唯一一件系统自己做不到的事。
+//TaskbarAl=0 之后系统把开始/搜索/视图/小组件和应用图标一路排在左边，应用图标不再居中，
+//所以由我们把这一整组往右挪到屏幕正中：偏移 = (屏幕宽 - 整组宽)/2 - 系统给这一组的左沿。
+//
+//为什么是"整组同一个偏移"而不是每个按钮各算各的：应用图标必须保持彼此紧挨着，
+//只要它们各自的 X 加同一个 delta，组内间距就是系统自己排出来的那份，不会散。
+//
+//为什么用"上一趟"的整组左沿和右沿：一趟排版是从最左边那个按钮开始逐个走到 Arrange 的，
+//排第一个的时候最后一个还没排，当场拿不到整组的宽度。用上一趟的数只会晚一帧；
+//而我们改的只是转发给原件的那个矩形，系统自己那份排版结果一个字都没变，
+//下一趟拿到的还是系统原样的 X —— 没有反馈回路，不会来回放大。
+//
+//怎么认出"新一趟开始了"：同一趟里按钮的 X 一定从小到大；这次拿到的 X 比这一趟已经见过的最小值
+//还靠左，就说明系统重新排了一整趟（开/关应用、切对齐、改任务栏位置都会重排）。
+//判据是一个坐标比较，不是计时器，也没有状态机。
+//
+//为什么宁可不居中也不许 delta 是负数：负偏移会把应用图标往左拖，一头叠到小组件/搜索框上；
+//算出来是负数就说明这一组已经宽到放不下，那种情况维持系统自己的排法更安全。
+//
+//白名单必须由片4 报上去的 TaskbarSplitClasses 现场确认：
+//一个都没命中时 AppGroup 那行是 match=0，一次偏移都不会下（宁可不居中，也别把托盘时钟排歪）。
+static constexpr const wchar_t* kAppIconClasses[] = { L"Taskbar.TaskListButton" };
+
+//只在任务栏线程访问（Arrange 全在那条线程上），不做原子：这些数一次读一次写都在同一趟里。
+static double g_app_sweep_min_dip{ 0.0 };      //这一趟里最左的 X
+static double g_app_sweep_max_dip{ 0.0 };      //这一趟里最右的 X+宽
+static double g_app_sweep_last_pos_dip{ 0.0 }; //这一趟上一个按钮的位置（用来认"是不是重新开始了一趟"）
+static int g_app_sweep_count{ 0 };
+static bool g_app_sweep_open{ false };         //这一趟已经开始记了没有
+//上一趟交出来的整组位置：偏移用的就是这两个数。
+static double g_app_group_left_dip{ 0.0 };
+static double g_app_group_right_dip{ 0.0 };
+static int g_app_group_count{ 0 };
+static long g_app_group_match{ 0 };            //一共命中过几次白名单（0 = 这个系统上应用按钮不叫这个名字）
+static double g_app_group_delta_dip{ 0.0 };    //最后一次真正加上去的偏移
+static bool g_app_group_vertical{ false };     //最后一次量到的轴向（诊断里写出来，别让人猜）
+
+static bool IsAppIconButton(std::wstring const& class_name)
+{
+    for (auto const candidate : kAppIconClasses)
+    {
+        if (class_name == candidate)
+            return true;
+    }
+    return false;
+}
+
+//发布这一组的现场。为什么单独一行而不塞进 TaskbarSplitEdges：Edges 那行已经被四格 + 小组件判据占满，
+//而"居中没居中"是他一眼就能看出来的毛病，需要一行专门的答案：
+//match=0 是名字不对（下一步照 Classes 改名单），n=1 是只有一个窗口（那本来就没得居中），
+//d=0 是算出来是负的（组太宽，故意不挪），d 正常但屏幕上没动才是"delta 没落到元素上"。
+static void PublishAppGroup(double panel_dip)
+{
+    if (g_app_group_match == 0)
+        return;     //一个都没命中：别写一行全是 0 的数骗人去看，Classes 那行才是这一轮的正确答案
+
+    wchar_t buf[192]{};
+    ::swprintf_s(buf, L"n=%d left=%d width=%d panel=%d d=%d axis=%s",
+        g_app_group_count,
+        static_cast<int>(std::lround(g_app_group_left_dip * 100.0)),
+        static_cast<int>(std::lround((g_app_group_right_dip - g_app_group_left_dip) * 100.0)),
+        static_cast<int>(std::lround(panel_dip * 100.0)),
+        static_cast<int>(std::lround(g_app_group_delta_dip * 100.0)),
+        g_app_group_vertical ? L"v" : L"h");
+
+    //拼好的串和上次一模一样就不进注册表：SplitRegWriteStringIfChanged 是"每次调用都开一次键查一遍"，
+    //而应用按钮每个都要排一次，一帧就是几十个按钮 —— 省掉那次查询比省掉那次写入更要紧。
+    static std::wstring last_published;
+    if (last_published == buf)
+        return;
+    last_published = buf;
+    SplitRegWriteStringIfChanged(kRegAppGroup, buf);
+}
+
+//rect 是系统排好的原样矩形（DIP，父容器坐标）。命中白名单就把整组偏移加进去并从 out_rect 交出去。
+//返回 false = 这个元素不是应用图标，调用方维持原来的处理。
+static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out_rect, double* out_panel)
+{
+    std::wstring class_name;
+    try
+    {
+        class_name = get_class_name(element);
+    }
+    catch (...)
+    {
+        return false;
+    }
+    if (!IsAppIconButton(class_name))
+        return false;
+
+    g_app_group_match++;
+
+    //轴向和"往哪儿居中"的总宽都按任务栏窗口自己算，不用元素的 ActualWidth：
+    //应用按钮的父容器很可能只撑到这一组的宽度（而不是整条任务栏），
+    //拿它折半等于偏移恒为 0，那一刀就白下了。
+    RECT tray_rc{};
+    UINT tray_dpi = 96;
+    if (!TrayFrame(&tray_rc, &tray_dpi))
+        return false;
+    const double scale = 96.0 / tray_dpi;
+    const double tray_w = (tray_rc.right - tray_rc.left) * scale;
+    const double tray_h = (tray_rc.bottom - tray_rc.top) * scale;
+    const bool vertical = tray_h > tray_w;
+    g_app_group_vertical = vertical;
+    const double panel_dip = vertical ? tray_h : tray_w;
+    const double pos = vertical ? static_cast<double>(rect.Y) : static_cast<double>(rect.X);
+    const double size = vertical ? static_cast<double>(rect.Height) : static_cast<double>(rect.Width);
+    *out_panel = panel_dip;
+
+    if (!g_app_sweep_open || pos <= g_app_sweep_last_pos_dip)
+    {
+        //新一趟开始：先把上一趟的结果交出来当这一趟的偏移依据。
+        //判据用"这一次的位置不比上一个靠左"：同一趟里按钮一定是一个比一个靠右（或靠下），
+        //位置倒退就是系统重新排了一整趟。用 <= 而不是 <，是因为关掉几个应用之后
+        //新一趟第一个按钮的位置和上一趟的第一个正好相同，那时必须重算，
+        //不然整组右沿还挂着已经关掉那几个的旧宽度，居中会一直偏左。
+        if (g_app_sweep_open && g_app_sweep_count > 0)
+        {
+            g_app_group_left_dip = g_app_sweep_min_dip;
+            g_app_group_right_dip = g_app_sweep_max_dip;
+            g_app_group_count = g_app_sweep_count;
+        }
+        g_app_sweep_min_dip = pos;
+        g_app_sweep_max_dip = pos + size;
+        g_app_sweep_count = 1;
+        g_app_sweep_open = true;
+    }
+    else
+    {
+        if (pos < g_app_sweep_min_dip)
+            g_app_sweep_min_dip = pos;
+        if (pos + size > g_app_sweep_max_dip)
+            g_app_sweep_max_dip = pos + size;
+        g_app_sweep_count++;
+    }
+    g_app_sweep_last_pos_dip = pos;
+
+    //偏移用上一趟的整组位置：这一趟还没排完，宽度不可信
+    double delta = 0.0;
+    if (g_app_group_right_dip > g_app_group_left_dip)
+    {
+        const double group_width = g_app_group_right_dip - g_app_group_left_dip;
+        const double target_left = (panel_dip - group_width) / 2.0;
+        delta = target_left - g_app_group_left_dip;
+        if (delta < 0.0)
+            delta = 0.0;      //宽到放不下：维持系统的排法，不把应用图标拖回按钮块上
+    }
+    g_app_group_delta_dip = delta;
+    PublishAppGroup(panel_dip);
+
+    if (delta <= 0.0)
+        return true;          //是应用图标，但这一趟不挪
+
+    Rect shifted = rect;
+    if (vertical)
+        shifted.Y = static_cast<float>(pos + delta);
+    else
+        shifted.X = static_cast<float>(pos + delta);
+    *out_rect = shifted;
+    return true;
+}
+
+//【片5 · 复原】把应用图标那一路的记账全部清零。
+//注意这里没有任何"还原元素"的动作，也不需要有：偏移只写在转发给原件的矩形里，
+//从来没写进 Margin/属性，功能一关，下一帧交回的就是系统自己排的那份 X，屏幕上当场就回去了。
+//要清只是清记账，省得下次开启时第一趟用着一个陈旧的组宽度、摆歪一下。
+static void ResetAppGroupAccounting()
+{
+    g_app_sweep_min_dip = 0.0;
+    g_app_sweep_max_dip = 0.0;
+    g_app_sweep_last_pos_dip = 0.0;
+    g_app_sweep_count = 0;
+    g_app_sweep_open = false;
+    g_app_group_left_dip = 0.0;
+    g_app_group_right_dip = 0.0;
+    g_app_group_count = 0;
+    g_app_group_delta_dip = 0.0;
 }
 
 //四个按钮各自报上来的右边沿，一行写清楚。为什么要这一行：块宽只有一个数，
@@ -1391,10 +1565,21 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
 
         if (!IsPinnedClusterButton(button))
         {
-            //不是那四个系统按钮的一切（应用图标、托盘、外壳自己的容器）：
+            //走到这里的一定不是那四个系统按钮（小组件在上面已经返回）：应用图标、托盘图标、外壳自己的容器。
             //先把类型名报上去，让"居中该下在哪个元素上"这件事用一行注册表回答，别靠猜（见 RecordClassName）。
-            if (button == SystemButton::None && RecordClassName(element, rect))
+            if (RecordClassName(element, rect))
                 PublishClasses();
+
+            //【片3】应用图标那一组整组居中：给这一组共同加一个偏移，组内间距还是系统排的那份。
+            //功能关着时这一整步跳过；而且偏移从没写进元素身上，只写在转发给原件的矩形里，
+            //所以取消勾选的那一帧就自己复原了，不需要任何"还原"代码（片5 只做记账清零）。
+            if (enabled)
+            {
+                Rect shifted = rect;
+                double panel_dip = 0.0;
+                if (CenterAppGroup(element, rect, &shifted, &panel_dip))
+                    return g_arrange_original(p_this, shifted);
+            }
             return g_arrange_original(p_this, rect);
         }
 

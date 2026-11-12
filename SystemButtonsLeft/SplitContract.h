@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 14:17:42 +08:00
+// Last Modified At: 2026-11-12 14:24:23 +08:00
 #pragma once
 #include <windows.h>
 
@@ -9,7 +9,7 @@
 //
 // 谁写谁读：
 //   插件（在 TrafficMonitor 进程里）写：TaskbarSplitEnabled、TaskbarSplitOwner、TaskbarSplitAckEvent、TaskbarSplitReqSeq、TaskbarSplitWnd
-//   助手（在 explorer.exe 里）写：TaskbarSplitActive、TaskbarSplitPid、TaskbarSplitBlock、TaskbarSplitClasses、TaskbarSplitAckSeq
+//   助手（在 explorer.exe 里）写：TaskbarSplitActive、TaskbarSplitPid、TaskbarSplitBlock、TaskbarSplitClasses、TaskbarSplitAppGroup、TaskbarSplitEdges、TaskbarSplitAckSeq
 //   主程序（TrafficMonitor.exe）读：TaskbarSplitActive、TaskbarSplitBlock —— 只用来把任务栏窗口摆在按钮块后面
 
 // 注册表位置
@@ -35,6 +35,16 @@ static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ
                                                                         //只收 Taskbar. 开头的那一族（应用图标/托盘/飞岛宿主都在这一族），每个名字只在第一次见到时写一行，之后这一行不再动。
                                                                         //这一行专门用来回答"应用图标那一组叫什么、住在谁的容器里"：居中的偏移要下在每个应用按钮身上还是下在它们共同的父亲身上，
                                                                         //看 p= 就知道；名字猜错的代价是偏移打在托盘时钟上、任务栏直接排坏，所以先读这一行再动代码。
+// 助手 -> 插件：下面这一个是方案 B 新加的（居中的那一刀下在应用图标组身上）
+//应用图标那一组"整组居中"的现场（方案 B 剩下的唯一一件系统自己做不到的事）。
+//偏移 = (panel - width)/2 - left，同一个偏移加在这一组每个按钮转发的矩形上，所以组内间距还是系统排的那份。
+//n=上一趟这一组有几个按钮，left=整组左沿(1/100 DIP，相对任务栏左沿)，width=整组宽，panel=折半对着的那个数（任务栏窗口的宽，竖排时是高），d=最后一次真正加上去的偏移，axis=h|v。
+//怎么读：压根没有这一行 = 白名单一个都没命中，别猜，去看 TaskbarSplitClasses，那一行才是"应用按钮到底叫什么"的答案；
+//n=1 = 只开着一个窗口，本来就没有"组"可居中；width 明显比屏幕上那一排窄 = 有按钮没被算进来，居中一定偏；
+//d=0 = 算出来是 0 或负数（这一组宽到放不下，故意不挪，维持系统的排法，宁可不齐也别叠到小组件上）；
+//d 正常但屏幕上没动 = 偏移没落到元素上，回头查 Arrange 转发矩形那一条路。
+//为什么单独一行不塞进 TaskbarSplitEdges：Edges 已经被四格 + 小组件判据占满，而"居中没居中"是一眼就能看出来的毛病，值得一行专门的答案。
+static constexpr const wchar_t* kRegAppGroup = L"TaskbarSplitAppGroup";   //REG_SZ 见上面那段
 static constexpr const wchar_t* kRegEdges = L"TaskbarSplitEdges";       //REG_SZ 助手报的现场四格：s=/se=/tv=/w= 每个按钮看得见的右边界(1/100 DIP)，src=uia|rect 这些数是 UIA 边界还是退回排版矩形，n=开始/搜索/视图/小组件各自累计经过挂钩几次，ev=小组件那格的事件（它自己的 Unloaded/Loaded/SizeChanged + 祖先链的 SizeChanged）进来了几次，vis=小组件元素的可见性(0=Visible 1=Collapsed 2=Hidden -1=还没量过)，aw=它的 ActualWidth(1/100 DIP)，
                                                                         //why=「这一格该不该抹掉」最终采纳的判据（6=元素已不在活树上(IsLoaded=false)；1=它自己没 Visible；2=某层祖先被折叠；3=边界非空但整个在任务栏外；4=祖先写着 Visible 却被排成 0 尺寸；5=元素被从树上摘掉；0=判不出来所以维持上一次的值；-1=还没判过），
                                                                         //pv=/pw= 直系父亲的可见性和 ActualWidth(1/100 DIP)：why=0 就看这两个数，父亲还是满宽说明收起来那层不在父亲身上。ld= IsLoaded(1/0/-1 问不出来)，ms= 这一轮到底量到了没有(1/0)——ms 把 why=0 的两种意思分开：量到了 vs 判不出来。
