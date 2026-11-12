@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-10 19:10:28 +08:00
+// Last Modified At: 2026-11-12 14:20:34 +08:00
 #include "framework.h"
 #include <cstring>
 #include <shlwapi.h>
@@ -158,7 +158,14 @@ void CTaskbarSplitController::LoadConfigAndApply()
     if (m_ini_file.empty())
         return;
     m_enabled = (::GetPrivateProfileIntW(L"settings", L"enabled", 0, m_ini_file.c_str()) != 0);
-    m_prev_alignment = static_cast<int>(::GetPrivateProfileIntW(L"settings", L"prev_alignment", 1, m_ini_file.c_str()));
+
+    //ini 里记的"他原来的对齐方式"什么时候可信：只有"启动时插件就是开着的"这一种情况。
+    //因为那种时候注册表里的 TaskbarAl 是我们自己上一轮写下去的 0（靠左），
+    //拿现场当"他原来的选择"就会把 0 记成基线，取消勾选只能还原到靠左、永远回不到他当初的居中。
+    //插件关着的时候现场就是他自己的选择，那次 enable 会按现场重新记一遍。
+    const UINT stored = static_cast<UINT>(::GetPrivateProfileIntW(L"settings", L"prev_alignment", -1, m_ini_file.c_str()));
+    m_prev_alignment_known = (m_enabled && stored != static_cast<UINT>(-1));
+    m_prev_alignment = m_prev_alignment_known ? (stored == 0 ? 0 : 1) : 1;
 
     if (!m_enabled)
     {
@@ -303,30 +310,17 @@ void CTaskbarSplitController::SwitchTaskbarAlignment(bool enable)
 {
     if (!m_status.windows11)
         return;
+
+    //方案 B（只留 B）：把 Windows 自己的对齐值写成"靠左"（TaskbarAl=0）。
+    //开始、搜索、多任务视图、小组件从此由系统自己钉在最左边，连开始菜单和搜索飞岛也一起靠左——
+    //飞岛那部分是系统读的同一个值，我们自己在"居中"排版里搬按钮永远做不出来，这正是选 B 的理由。
+    //助手只剩两件系统做不到的事：把应用图标那一组整组居中，以及报出按钮块的右边界让 TM 的窗口跟上。
+    //所以这里不再按"助手行不行"分三档写值：写 0 本身就是功能，不是兜底手段。
+    //助手没生效时最坏的结果也只是应用图标跟着一起靠左（=Windows 原生的靠左），不会更坏、也不会叠位。
     if (enable)
-    {
-        if (m_status.split_active)
-        {
-            //助手真的在钉 -> Windows 保持“居中”，系统按钮由助手搬到左边，其他图标仍然居中
-            WriteTaskbarAl(true);
-        }
-        else if (m_status.helper_injected)
-        {
-            //助手已经注入进 explorer，只是还没证明自己能钉住（槽位不对、还没排版过一次等）。
-            //这时候绝不能改成“靠左”：那会让所有应用图标跟着一起靠左，用户看到的是“越开越坏”。
-            //保持 Windows 现在的样子，等 OnHelperStateChanged 收到 active=1 再切“居中”。
-            WriteTaskbarAl(m_prev_alignment != 0);
-        }
-        else
-        {
-            //助手根本装不上（dll 缺失、位数不对、钩子失败）-> 退回 Windows 自带的“靠左”
-            WriteTaskbarAl(false);
-        }
-    }
+        WriteTaskbarAl(false);
     else
-    {
-        WriteTaskbarAl(m_prev_alignment != 0);
-    }
+        WriteTaskbarAl(m_prev_alignment != 0);    //取消勾选：把他原来的选择还回去
 }
 
 bool CTaskbarSplitController::Apply(bool enable, std::wstring& msg)
@@ -337,24 +331,30 @@ bool CTaskbarSplitController::Apply(bool enable, std::wstring& msg)
 
     if (enable)
     {
-        //记下用户原本的对齐方式，取消勾选时好还原
-        m_prev_alignment = m_status.taskbar_center_align ? 1 : 0;
+        //记下他原本的对齐方式，取消勾选时还原。已经记过就不再记：
+        //开启状态下现场的 TaskbarAl 就是我们自己写的值，再读一次就把功能值当成了他的选择。
+        if (!m_prev_alignment_known)
+        {
+            m_prev_alignment = m_status.taskbar_center_align ? 1 : 0;
+            m_prev_alignment_known = true;
+        }
 
         EjectHelper();
         inject_ok = InjectHelper(msg);
         if (inject_ok)
             WaitForHelperAck(3000);       //等助手装好挂钩并回话
         RefreshStatus();
-        //能钉住就保持“居中”（由助手把按钮挪到左边），钉不住才退回系统自带的“靠左”。
-        //写 TaskbarAl 会广播 TraySettings，任务栏重新排版一次，助手也就能证明自己真的生效了。
+        //方案 B：直接把 Windows 的对齐值写成“靠左”，这就是功能本身，不分“助手行不行”几档。
+        //写 TaskbarAl 会广播 TraySettings，任务栏重新排版一次，助手在这次排版里把应用图标居中、
+        //并报出按钮块的右边界。
         SwitchTaskbarAlignment(true);
-        StartWatchingHelperState();       //助手随后上报状态时，这边跟着对齐
+        StartWatchingHelperState();       //助手随后上报新块宽时，这边马上把 TM 的窗口搬过去
     }
     else
     {
         StopWatchingHelperState();
         PublishEnabledState(false);
-        //先还原对齐（会触发一次重新排版），助手在这次排版里把自己加过的负边距撤掉，然后才摘钩子
+        //先还原对齐（会触发一次重新排版），助手在这次排版里把旧版留下的边距擦干净，然后才摘钩子
         SwitchTaskbarAlignment(false);
         EjectHelper();
     }
@@ -369,18 +369,26 @@ bool CTaskbarSplitController::Apply(bool enable, std::wstring& msg)
     if (!m_ini_file.empty())
     {
         ::WritePrivateProfileStringW(L"settings", L"enabled", enable ? L"1" : L"0", m_ini_file.c_str());
-        std::wstring prev = std::to_wstring(m_prev_alignment);
-        ::WritePrivateProfileStringW(L"settings", L"prev_alignment", prev.c_str(), m_ini_file.c_str());
+        if (m_prev_alignment_known)
+        {
+            std::wstring prev = std::to_wstring(m_prev_alignment);
+            ::WritePrivateProfileStringW(L"settings", L"prev_alignment", prev.c_str(), m_ini_file.c_str());
+        }
+        else
+            ::WritePrivateProfileStringW(L"settings", L"prev_alignment", nullptr, m_ini_file.c_str());
     }
+    //还原完之后这件事就作废：下次开启时现场就是他自己的选择，得按现场重新记一次
+    if (!enable)
+        m_prev_alignment_known = false;
 
     if (enable && !inject_ok)
     {
-        //上面 SwitchTaskbarAlignment(true) 已经按“助手没生效”处理过了：
-        //Win11 上退回系统自带的“靠左”（应用图标会跟着一起靠左），Win10 上不动系统设置。
+        //上面 SwitchTaskbarAlignment(true) 已经把 Windows 写成“靠左”了，Win10/Win11 之外不动系统设置。
+        //助手没进来，缺的只是“应用图标整组居中”和“TM 窗口跟着按钮块走”这两件由助手做的事。
         if (msg.empty())
             msg = L"助手没能注入 explorer。";
         if (m_status.windows11)
-            msg += L"已退回 Windows 自带的“靠左”（应用图标也会一起靠左）。";
+            msg += L"系统按钮已按 Windows 自带的“靠左”排好；应用图标那一组不会居中，因为居中那一刀在助手 DLL 里。";
         else
             msg += L"本插件只在 Windows 11 上有意义，未改动系统设置。";
         m_last_msg = msg;
@@ -388,15 +396,15 @@ bool CTaskbarSplitController::Apply(bool enable, std::wstring& msg)
     }
     if (enable && !m_status.split_active)
     {
-        m_last_msg = L"助手已注入，等任务栏排一次版才真正钉住；这期间不动 Windows 的对齐设置。"
+        m_last_msg = L"系统按钮已靠左；助手已注入，等任务栏排一次版才开始把应用图标居中并报出按钮块的右边界。"
             L"下面“诊断”一行会说明助手卡在哪一步。";
         msg = m_last_msg;
         return true;
     }
     if (enable)
-        m_last_msg = L"已启用：系统按钮靠左，应用图标居中。";
+        m_last_msg = L"已启用：系统按钮靠左（Windows 自己的排版），应用图标居中（助手做的）。";
     else
-        m_last_msg = L"未启用：使用 Windows 默认布局。";
+        m_last_msg = L"未启用：已把 Windows 的任务栏对齐方式还原成原来的选择。";
     return true;
 }
 
@@ -430,8 +438,8 @@ void CTaskbarSplitController::RefreshStatus()
     m_status.taskbar_center_align = (al != 0);
 }
 
-//监听助手写回来的状态：助手在 explorer 里真正钉好按钮后会把 TaskbarSplitActive 写进注册表，
-//这边收到变化就把 Windows 的对齐方式跟一手（能钉住就保持“居中”，钉不住才退回“靠左”）。
+//监听助手写回来的状态：助手在 explorer 里量出新的按钮块右边界就把 TaskbarSplitBlock 写进注册表，
+//这边收到变化就把 TM 的任务栏窗口搬过去（方案 B 下对齐值在启用那一步就写好了，这里不再跟）。
 //只在 HKCU\Software\TrafficMonitor 上等待通知，不碰 TaskbarAl 那个键，所以不会自己叫醒自己。
 void CTaskbarSplitController::StartWatchingHelperState()
 {
@@ -505,9 +513,8 @@ void CTaskbarSplitController::OnHelperStateChanged()
         CTaskbarWndAnchor::ApplyNow();
     if (!m_enabled)
         return;
-    //助手证明自己钉住了 -> 把 Windows 切到“居中”（这是拆分布局的前提）。
-    //反过来什么都不做：助手掉线或自检没过时绝不能改成“靠左”，那会让所有应用图标一起靠左，
-    //比保持原样更糟；这种情况只在“诊断”一行里说清楚卡在哪。
-    if (m_status.split_active && !m_status.taskbar_center_align)
-        WriteTaskbarAl(true);
+    //方案 B 到这里就没有"跟着切对齐"这件事了：对齐值是启用那一步就写好的“靠左”，
+    //助手上报的只是块宽（应用图标居中那一路也在它自己进程里做，不需要这边配合）。
+    //以前那套"助手证明钉住了才写居中、没证明就什么都不写"是给已删掉的居中标本配的，
+    //留着就会在助手一上报状态时把系统又切回居中，把整条功能关掉。
 }

@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-10 19:09:21 +08:00
+// Last Modified At: 2026-11-12 14:20:34 +08:00
 #pragma once
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -22,14 +22,16 @@ struct SplitStatus
     int block_width{ 0 };           //被钉在左侧的系统按钮块宽度（DIP）
     int block_width_100{ 0 };       //同一个数的原始精度：按钮块右边界，1/100 DIP（插件摆 TM 任务栏窗口时用它，避免每次截断丢 1 像素）
     int helper_step{ 0 };           //助手走到哪一步了（kStep*），0 表示当前 explorer 里没有助手在跑
-    bool taskbar_center_align{ true };   //Windows 自己的“任务栏图标对齐”当前值
+    bool taskbar_center_align{ true };   //Windows 自己的“任务栏图标对齐”当前值（方案 B 开着时这个数就是 0=靠左）
 };
 
 // “win按钮居左，软件图标居中”的宿主端控制器（运行在 TrafficMonitor 进程里）。
 // 它做三件事：
 //   1）把自己的开关状态通过注册表告诉 explorer 里的助手 DLL；
 //   2）把助手 DLL 用 SetWindowsHookEx(WH_GETMESSAGE) 注入 explorer 的任务栏线程；
-//   3）按助手的实际情况切换 Windows 的 TaskbarAl（助手可用时保持“居中”，不可用时退回“靠左”）。
+//   3）把 Windows 自己的对齐值切成“靠左”（TaskbarAl=0，方案 B 的基准），取消勾选时还原成他原来的选择。
+//     系统按钮由系统自己钉在最左边，连开始菜单和搜索飞岛也一起靠左——这就是选 B 的全部理由；
+//     应用图标那一组的居中是 explorer 里助手做的事，这边不再切任何“居中”。
 //   4）把助手报回来的按钮块边界交给 CTaskbarWndAnchor，让 TrafficMonitor 自己的任务栏窗口
 //     紧跟在这个块后面——这一步完全在插件里做，主程序代码不用改。
 class CTaskbarSplitController
@@ -77,6 +79,10 @@ private:
     std::wstring m_ini_file;
     bool m_enabled{ false };
     int m_prev_alignment{ 1 };      //启用插件之前 Windows 的对齐方式（1:居中 0:靠左）
+    //上面那个数有没有真的记下来：插件开着的时候现场的 TaskbarAl 是我们自己写的 0，
+    //再按现场记一次就会把"靠左"当成他原来的选择，取消勾选就永远回不到他当初的居中。
+    //所以只有"本次开启之前插件是关着的"或"启动时插件就是开着的、ini 里存过一份"才可信。
+    bool m_prev_alignment_known{ false };
     HMODULE m_helper_module{};
     HHOOK m_hook{};
     HANDLE m_ack_event{};

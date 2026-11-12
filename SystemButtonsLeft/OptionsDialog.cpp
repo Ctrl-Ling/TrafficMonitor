@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 12:01:10 +08:00
+// Last Modified At: 2026-11-12 14:20:34 +08:00
 #include "framework.h"
 #include <cstdio>
 #include <cwchar>
@@ -75,12 +75,12 @@ static void RefreshStatusLines(HWND hDlg)
             ::swprintf_s(buf, L"助手：已在 explorer.exe 中挂钩，左侧按钮块宽 %d DIP", st.block_width);
     }
     else if (st.helper_injected)
-        ::swprintf_s(buf, L"助手：已注入，但没能改写布局（未改动 Windows 的对齐设置）");
+        ::swprintf_s(buf, L"助手：已注入，还没报出按钮块（系统按钮已经靠左，应用图标暂时不居中）");
     else
         ::swprintf_s(buf, L"助手：已就位，尚未注入");
     SetStatusLine(hDlg, IDC_STATUS_LINE3, buf);
 
-    ::swprintf_s(buf, L"Windows 任务栏图标对齐：%s（拆分生效时保持“居中”）",
+    ::swprintf_s(buf, L"Windows 任务栏图标对齐：%s（方案 B：开启时就是“靠左”，取消勾选还原成原来的选择）",
         st.taskbar_center_align ? L"居中" : L"靠左");
     SetStatusLine(hDlg, IDC_STATUS_LINE4, buf);
 
