@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 14:24:23 +08:00
+// Last Modified At: 2026-11-12 15:23:03 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -17,6 +17,7 @@
 #include <cwctype>
 #include <cmath>        //std::abs/std::lround/std::isfinite：块宽（DIP）的比较与换算
 #include <cstdio>       //swprintf_s：把自检现场拼成一句话写进注册表
+#include <string>       //std::to_wstring：拼 TaskbarSplitClasses 那一行（不靠别的头顺带带进来）
 #include <mutex>
 
 using namespace winrt;
@@ -167,6 +168,10 @@ static void WriteBuildStamp()
     SplitRegWriteStringIfChanged(kRegBuild, wide);
 }
 
+//前置声明要放在这里（不是下面那一堆的后面）：挂钩刚证明自己能跑时就要报名字，
+//而那张名字表的函数体在下面才写出来。
+static void PublishClasses();
+
 //第一次真的看到任务栏按钮经过挂钩，说明“钉住”这件事在当前的 explorer 里成立了，
 //这一刻才把 active/pid 报出去（装配完成的当场还不能确定，因为要等一次真正的排版）。
 //注册表监视是双向的，所以这里用“变了才写”的接口，避免自己叫醒自己空转。
@@ -188,7 +193,6 @@ static std::vector<winrt::weak_ref<FrameworkElement>> g_touched_elements;
 static SystemButton IdentifySystemButton(FrameworkElement const& element);
 static bool IsPinnedClusterButton(SystemButton button);
 static bool RecordClassName(FrameworkElement const& element, Rect rect);
-static void PublishClasses();
 static void ResetAppGroupAccounting();
 static void ClearStaleClusterMargin(FrameworkElement const& element);
 static void ClearStaleWidgetsOffset(FrameworkElement const& element);
@@ -755,25 +759,26 @@ static bool RecordClassName(FrameworkElement const& element, Rect rect)
 //所以这一行是给"下一轮编译前先看注册表"用的证据，不是运行时要读的东西。
 static void PublishClasses()
 {
-    wchar_t buf[1024]{};
-    int used = 0;
-
+    //一行一行接在 std::wstring 上，不用 swprintf_s 往 buf+used 里续写：
+    //那个写法要么得手动算剩余长度（算错一次就是“缓冲区不足”，而 swprintf_s 撞到这种情况
+    //走的是参数校验器，默认直接把进程干掉——这条就在 Arrange 的路上，绝不能拿 explorer 冒险），
+    //要么得一格一格拼；数字都是整数和已经拿到手的类名，拼字符串本身就够用。
     std::lock_guard<std::mutex> lock(g_class_mutex);
-    used = ::swprintf_s(buf, L"n=%d", static_cast<int>(g_class_records.size()));
-    if (used < 0)
-        return;
+
+    std::wstring line = L"n=" + std::to_wstring(static_cast<int>(g_class_records.size()));
     for (auto& item : g_class_records)
     {
-        if (used > 860)
+        if (line.size() > 860)      //注册表这一行留个尾巴就够看，超了不再往下拼
             break;
-        const int added = ::swprintf_s(buf + used, L" | %s c=%d x=%d w=%d p=%s",
-            item.name.c_str(), static_cast<int>(item.count), item.x_100, item.w_100,
-            item.parent.empty() ? L"?" : item.parent.c_str());
-        if (added < 0)
-            break;
-        used += added;
+        line += L" | ";
+        line += item.name;
+        line += L" c=" + std::to_wstring(static_cast<int>(item.count));
+        line += L" x=" + std::to_wstring(item.x_100);
+        line += L" w=" + std::to_wstring(item.w_100);
+        line += L" p=";
+        line += item.parent.empty() ? std::wstring(L"?") : item.parent;
     }
-    SplitRegWriteStringIfChanged(kRegClasses, buf);
+    SplitRegWriteStringIfChanged(kRegClasses, line.c_str());
 }
 
 //【片3 · 把应用图标那一组整组居中】方案 B 剩下的唯一一件系统自己做不到的事。
