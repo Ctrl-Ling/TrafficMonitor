@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 18:31:00 +08:00
+// Last Modified At: 2026-11-13 08:23:18 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -819,6 +819,8 @@ static long g_app_group_match{ 0 };            //一共命中过几次白名单�
 static double g_app_group_delta_dip{ 0.0 };    //最后一次真正加上去的偏移
 static bool g_app_group_vertical{ false };     //最后一次量到的轴向（诊断里写出来，别让人猜）
 static double g_app_group_limit_dip{ 0.0 };    //这一组排完还剩多少可挪的余量（面板边到最右沿），偏移被它卡住时 lim 就是负数/0
+static double g_app_group_size_dip{ 0.0 };     //最后一次命中元素自己的宽（1/100 DIP）：sz 小=打在按钮上，sz 大=打在容器上
+static long g_app_group_too_wide{ 0 };         //因为"宽得不像一个按钮"而拒绝下刀的次数（wide 涨=名单命中了容器那一层）
 
 static bool IsAppIconButton(std::wstring const& class_name)
 {
@@ -842,13 +844,15 @@ static void PublishAppGroup(double panel_dip)
         return;     //一个都没命中：别写一行全是 0 的数骗人去看，Classes 那行才是这一轮的正确答案
 
     wchar_t buf[192]{};
-    ::swprintf_s(buf, L"n=%d left=%d width=%d panel=%d d=%d lim=%d axis=%s",
+    ::swprintf_s(buf, L"n=%d left=%d width=%d panel=%d d=%d lim=%d sz=%d wide=%d axis=%s",
         g_app_group_count,
         static_cast<int>(std::lround(g_app_group_left_dip * 100.0)),
         static_cast<int>(std::lround((g_app_group_right_dip - g_app_group_left_dip) * 100.0)),
         static_cast<int>(std::lround(panel_dip * 100.0)),
         static_cast<int>(std::lround(g_app_group_delta_dip * 100.0)),
         static_cast<int>(std::lround(g_app_group_limit_dip * 100.0)),
+        static_cast<int>(std::lround(g_app_group_size_dip * 100.0)),
+        static_cast<int>(g_app_group_too_wide),
         g_app_group_vertical ? L"v" : L"h");
 
     //拼好的串和上次一模一样就不进注册表：SplitRegWriteStringIfChanged 是"每次调用都开一次键查一遍"，
@@ -894,6 +898,23 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
     const double pos = vertical ? static_cast<double>(rect.Y) : static_cast<double>(rect.X);
     const double size = vertical ? static_cast<double>(rect.Height) : static_cast<double>(rect.Width);
     *out_panel = panel_dip;
+    g_app_group_size_dip = size;
+
+    //名单有可能整个打在"装着所有应用按钮的那个容器"上：Classes 里按钮一层和容器一层常常都带
+    //Taskbar. 这一族的名字，光看名字分不出来。打在容器上会同时坏两件事——
+    //容器带着小组件一起平移（截图里天气就跟着图标跑到最右边），
+    //而且"整组宽"变成容器宽，折半算出来的偏移根本不是那一刀。
+    //判据只用已经在手的这个数，不问名字：一个应用按钮占不掉任务栏的六分之一，
+    //宽过这个比例就认定"这不是按钮"——不挪、不记账（宁可不居中），wide= 记一笔，
+    //到底是哪一层被命中，交给 sz= 和 Classes 的 p= 说。
+    if (size > panel_dip / 6.0)
+    {
+        g_app_group_too_wide++;
+        g_app_group_delta_dip = 0.0;
+        g_app_group_limit_dip = 0.0;
+        PublishAppGroup(panel_dip);
+        return false;
+    }
 
     //轴一变（任务栏从下边拖到左边/右边），上一趟记的 min/max 就是另一条轴上的数，
     //拿屏幕高度去推横向偏移，能把整组推到看不见的位置上。
