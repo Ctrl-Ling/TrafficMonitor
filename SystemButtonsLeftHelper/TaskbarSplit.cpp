@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-13 09:06:28 +08:00
+// Last Modified At: 2026-11-13 10:25:50 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -839,6 +839,46 @@ static double g_app_group_limit_dip{ 0.0 };    //这一组排完还剩多少可�
 static double g_app_group_size_dip{ 0.0 };     //最后一次命中元素自己的宽（1/100 DIP）：sz 小=打在按钮上，sz 大=打在容器上
 static long g_app_group_too_wide{ 0 };         //因为"宽得不像一个按钮"而拒绝下刀的次数（wide 涨=名单命中了容器那一层）
 static long g_app_group_phantom{ 0 };          //ItemsRepeater 回收/虚拟化时那种"负坐标或零宽"的幽灵排布，被挡掉的次数
+static double g_app_group_offset_dip{ 0.0 };   //排版矩形的 X 到屏幕左沿的平移量（父容器自己在任务栏里偏右多少）
+static long g_app_group_calib{ 0 };            //这个平移量成功量到几次（0 = peer 一直不认，整组只能按老口径居中）
+
+//最左那颗应用按钮在屏幕上的真实左沿（DIP，相对任务栏左沿）。
+//为什么非要用 peer 量这一次：交给挂钩的 rect.X 是排版矩形的坐标，也就是"父容器那一层"的坐标，
+//父容器（现场确认是 ItemsRepeater）自己在任务栏里偏右多少，排版矩形里一个字都没有。
+//现场（1920@125%，注册表 + 截图各量一遍）：left=14320、d=36080 按公式应当落在 504 DIP，
+//屏幕上亮核量到 526.8 DIP —— 差 22.8 DIP，正好半颗按钮，就是你看到的"图标不居中"。
+//折半的公式没错，错的是拿排版坐标当屏幕坐标用。peer 给的是物理像素的可见边界，和截图一个口径，
+//左边三格早就用它了，这里沿用同一把尺子。
+//只在"新一趟的第一个按钮"上量一次（一趟一次），Arrange 是每帧每个按钮都要过的热路径，不能每颗都问。
+static bool MeasureAppLeftEdgeDip(FrameworkElement const& element, RECT const& tray_rc, UINT dpi,
+    double* out_left_dip)
+{
+    try
+    {
+        auto peer = xaml_peers::FrameworkElementAutomationPeer::CreatePeerForElement(element);
+        if (!peer)
+            return false;
+        const Rect bounds = peer.GetBoundingRectangle();
+        if (!std::isfinite(bounds.Width) || !std::isfinite(bounds.Height) ||
+            bounds.Width <= 0.0 || bounds.Height <= 0.0)
+            return false;
+        //和 UnionBoundsIntoSpan 同一道判据：中心点必须落在任务栏那条带子里，
+        //不然量到的是模板里挂着的整屏内容岛，那个数拿来居中能把整组甩出屏幕。
+        const double mid_y = static_cast<double>(bounds.Y) + bounds.Height / 2.0;
+        if (mid_y < static_cast<double>(tray_rc.top) || mid_y >= static_cast<double>(tray_rc.bottom))
+            return false;
+        const double scale = 96.0 / dpi;
+        const double left = (static_cast<double>(bounds.X) - tray_rc.left) * scale;
+        if (!std::isfinite(left) || left < 0.0 || left > 100000.0)
+            return false;
+        *out_left_dip = left;
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
 
 static bool IsAppIconButton(std::wstring const& class_name)
 {
@@ -856,19 +896,24 @@ static bool IsAppIconButton(std::wstring const& class_name)
 //d=0 是算出来是负的（组太宽，故意不挪），d 正常但屏幕上没动才是"delta 没落到元素上"。
 //lim= 是"这一趟真实排到的最右沿到面板边还剩多少"：d 被 lim 卡住（d≈lim 或 lim<=0）就说明
 //这一组比上一趟宽、正在往外冒，那一帧挤一下是故意的，飞出任务栏（图标整排看不见）才是事故。
+//off= 是"排版矩形的 X 到屏幕左沿的平移量"（父容器在任务栏里偏右多少），cal= 是它成功量到几趟。
+//怎么用它判"居中偏了"：left 现在是屏幕口径，所以 left + width/2 + d 应当正好等于 panel/2，
+//对不上就是 off 没量到（cal=0 或 off=0）；屏幕上看着偏、但这三个数自洽，偏的量就是 off 缺的那一截。
 static void PublishAppGroup(double panel_dip)
 {
     if (g_app_group_match == 0)
         return;     //一个都没命中：别写一行全是 0 的数骗人去看，Classes 那行才是这一轮的正确答案
 
-    wchar_t buf[192]{};
-    ::swprintf_s(buf, L"n=%d left=%d width=%d panel=%d d=%d lim=%d sz=%d wide=%d ph=%d axis=%s",
+    wchar_t buf[256]{};
+    ::swprintf_s(buf, L"n=%d left=%d width=%d panel=%d d=%d lim=%d off=%d cal=%d sz=%d wide=%d ph=%d axis=%s",
         g_app_group_count,
         static_cast<int>(std::lround(g_app_group_left_dip * 100.0)),
         static_cast<int>(std::lround((g_app_group_right_dip - g_app_group_left_dip) * 100.0)),
         static_cast<int>(std::lround(panel_dip * 100.0)),
         static_cast<int>(std::lround(g_app_group_delta_dip * 100.0)),
         static_cast<int>(std::lround(g_app_group_limit_dip * 100.0)),
+        static_cast<int>(std::lround(g_app_group_offset_dip * 100.0)),
+        static_cast<int>(g_app_group_calib),
         static_cast<int>(std::lround(g_app_group_size_dip * 100.0)),
         static_cast<int>(g_app_group_too_wide),
         static_cast<int>(g_app_group_phantom),
@@ -970,8 +1015,27 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
         //不然整组右沿还挂着已经关掉那几个的旧宽度，居中会一直偏左。
         if (g_app_sweep_open && g_app_sweep_count > 0)
         {
-            g_app_group_left_dip = g_app_sweep_min_dip;
-            g_app_group_right_dip = g_app_sweep_max_dip;
+            //整组位置换成屏幕口径再交出去。
+            //这一趟第一个按钮就是最左那颗（同一趟里 X 从小到大，这正是认趟的判据），
+            //它此刻的可见左沿是上一帧的结果 = 系统原来那个 X + 上一趟真正加上去的那个偏移，
+            //所以 平移量 = peer 左沿 - 上一趟最左 X - 正在生效的偏移。
+            //这个数不缓存、每趟当场重算：刚关掉一个应用那一帧，最左那颗换了人，
+            //peer 读回来的是它自己上一帧的位置（偏右一颗按钮），于是这一趟少挪一颗、下一趟自动正回来；
+            //缓存反而会把这个错帧锁死，所以宁可抖一帧。
+            double offset = 0.0;
+            double peer_left = 0.0;
+            if (MeasureAppLeftEdgeDip(element, tray_rc, tray_dpi, &peer_left))
+            {
+                g_app_group_calib++;
+                const double candidate = peer_left - g_app_sweep_min_dip - g_app_group_delta_dip;
+                //平移量到"半个面板"以外就是没量对（这颗按钮这会儿不在任务栏那条带子里）：
+                //当没量到，维持老口径，宁可不居中也别把整组甩出屏。
+                if (candidate >= -panel_dip / 2.0 && candidate <= panel_dip / 2.0)
+                    offset = candidate;
+            }
+            g_app_group_offset_dip = offset;
+            g_app_group_left_dip = g_app_sweep_min_dip + offset;
+            g_app_group_right_dip = g_app_sweep_max_dip + offset;
             g_app_group_count = g_app_sweep_count;
         }
         g_app_sweep_min_dip = pos;
@@ -990,7 +1054,9 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
     }
     g_app_sweep_last_pos_dip = pos;
 
-    //偏移用上一趟的整组位置：这一趟还没排完，宽度不可信
+    //偏移用上一趟的整组位置：这一趟还没排完，宽度不可信。
+    //left/right 已经是屏幕口径（见上面那份平移量），所以这里折半折的是任务栏面板的正中，
+    //不是排版矩形那套坐标的中点——早先差半颗按钮就差在这两句不是一回事。
     double delta = 0.0;
     if (g_app_group_right_dip > g_app_group_left_dip)
     {
@@ -1006,9 +1072,10 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
     //这一趟比上一趟宽，照旧宽度折半，最右边那几个的 X+宽 就越过任务栏那头去了，
     //XAML 把它们排在面板外面，屏幕上看到的就是"图标消失一片"。
     //这里拿"当前这一趟已经排到的最右沿"当场卡住：越不过面板边。
+    //最右沿是排版坐标，所以要把同一份平移量加进去才是屏幕上的位置——不加就少卡那一截。
     //上限只会随按钮逐个排过来越收越紧，不会一帧松一帧紧，所以不会来回摆。
     //代价是那一帧右边几个按钮挤得近一点（宁可挤，不许飞出屏），下一趟宽度补齐就正了。
-    const double limit = panel_dip - g_app_sweep_max_dip;
+    const double limit = panel_dip - g_app_group_offset_dip - g_app_sweep_max_dip;
     if (delta > limit)
         delta = (limit > 0.0) ? limit : 0.0;
     g_app_group_limit_dip = limit;
@@ -1044,6 +1111,8 @@ static void ResetAppGroupAccounting()
     g_app_group_count = 0;
     g_app_group_delta_dip = 0.0;
     g_app_group_limit_dip = 0.0;
+    g_app_group_offset_dip = 0.0;
+    g_app_group_calib = 0;
 }
 
 //四个按钮各自报上来的右边沿，一行写清楚。为什么要这一行：块宽只有一个数，

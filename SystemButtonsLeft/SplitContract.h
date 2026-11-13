@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-13 09:06:28 +08:00
+// Last Modified At: 2026-11-13 10:25:50 +08:00
 #pragma once
 #include <windows.h>
 
@@ -38,7 +38,7 @@ static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ
 // 助手 -> 插件：下面这一个是方案 B 新加的（居中的那一刀下在应用图标组身上）
 //应用图标那一组"整组居中"的现场（方案 B 剩下的唯一一件系统自己做不到的事）。
 //偏移 = (panel - width)/2 - left，同一个偏移加在这一组每个按钮转发的矩形上，所以组内间距还是系统排的那份。
-//n=上一趟这一组有几个按钮，left=整组左沿(1/100 DIP，相对任务栏左沿)，width=整组宽，panel=折半对着的那个数（任务栏窗口的宽，竖排时是高），d=最后一次真正加上去的偏移，lim=这一趟真实排到的最右沿到面板边还剩多少余量，sz=最后一次命中元素自己的宽(1/100 DIP)，wide=因为"宽得不像按钮"被拒绝下刀的次数，ph=因为"负坐标/零宽"被挡掉的幽灵排布次数，axis=h|v。
+//n=上一趟这一组有几个按钮，left=整组左沿(1/100 DIP，相对任务栏左沿，屏幕口径)，width=整组宽，panel=折半对着的那个数（任务栏窗口的宽，竖排时是高），d=最后一次真正加上去的偏移，lim=这一趟真实排到的最右沿到面板边还剩多少余量，off=排版矩形的 X 到屏幕左沿的平移量(1/100 DIP)，cal=这个平移量成功量到几趟，sz=最后一次命中元素自己的宽(1/100 DIP)，wide=因为"宽得不像按钮"被拒绝下刀的次数，ph=因为"负坐标/零宽"被挡掉的幽灵排布次数，axis=h|v。
 //怎么读：压根没有这一行 = 白名单一个都没命中，别猜，去看 TaskbarSplitClasses，那一行才是"应用按钮到底叫什么"的答案；
 //left 是几万位的负数 / width=0 / lim 大得离谱 = 记账被 ItemsRepeater 的幽灵排布污染了（那一趟根本没排真的按钮），
 //     现在这种排布直接挡在记账外面（ph 会涨），不再参与居中；
@@ -49,6 +49,11 @@ static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ
 //d≈lim 或 lim<=0 = 这一组比上一趟宽、正往外冒，偏移被面板边卡住了：那一帧右边几个按钮挤近一点是故意的，
 //                  不卡就会把最右边那几个排到任务栏外面，屏幕上看到的就是"应用图标整排消失"（下一趟宽度补齐就正了）；
 //d 正常但屏幕上没动 = 偏移没落到元素上，回头查 Arrange 转发矩形那一条路。
+//d 正常、屏幕上动了但整组偏一截 = 偏的量就是 off 缺的那一截：排版矩形的 X 是父容器（ItemsRepeater）那一层的坐标，
+//   父容器自己在任务栏里偏右多少它不说，早先整组看着"永远偏半颗按钮"就差这 22.8 DIP。
+//   现在整组左沿改用 UIA 边界（屏幕口径）当场校准：off 应当是个稳定的小数（几十 DIP 内），cal 跟着趟数涨；
+//   cal=0 或 off=0 = peer 一直量不到这颗按钮，居中退回老口径，症状就是"差半颗按钮"，不会更坏。
+//自洽检查（不用看屏幕）：left + d + width/2 应当等于 panel/2；对不上就是 off 没吃到。
 //axis 一变（任务栏拖到侧边）上一趟的记账当场作废、这一趟不挪，所以那一趟看到 d=0 是正常的，不是算错。
 //为什么单独一行不塞进 TaskbarSplitEdges：Edges 已经被四格 + 小组件判据占满，而"居中没居中"是一眼就能看出来的毛病，值得一行专门的答案。
 static constexpr const wchar_t* kRegAppGroup = L"TaskbarSplitAppGroup";   //REG_SZ 见上面那段
