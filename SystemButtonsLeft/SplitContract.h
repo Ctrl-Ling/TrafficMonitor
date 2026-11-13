@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-13 08:23:18 +08:00
+// Last Modified At: 2026-11-13 09:06:28 +08:00
 #pragma once
 #include <windows.h>
 
@@ -29,7 +29,7 @@ static constexpr const wchar_t* kRegWnd = L"TaskbarSplitWnd";           //REG_SZ
 static constexpr const wchar_t* kRegAckSeq = L"TaskbarSplitAckSeq";     //REG_DWORD 助手已经处理完的请求序号（等于 kRegReqSeq 表示这一轮做完了）
 static constexpr const wchar_t* kRegActive = L"TaskbarSplitActive";     //REG_DWORD 1：助手已在当前 explorer.exe 里挂钩成功
 static constexpr const wchar_t* kRegPid = L"TaskbarSplitPid";           //REG_DWORD 助手所在进程（explorer）的ID
-static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的右边界，单位 1/100 DIP（= 四格里最右边那格的"看得见"右边界，不是排版矩形——排版矩形和屏幕上那块差一两个按钮位，TM 任务栏窗口就紧跟在这条线后面）
+static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的右边界，单位 1/100 DIP（= 开始/搜索/多任务视图 三格里最右边那格的"看得见"右边界，不是排版矩形——排版矩形和屏幕上那块差一两个按钮位，TM 任务栏窗口就紧跟在这条线后面。小组件那一格暂时不并进来：它排在哪儿还没量准，误并会把 TM 顶到托盘跟前，等 TaskbarSplitEdges 的 w= 有数了再定）
 static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ 助手看到的"不是那四个系统按钮"的控件类型名，格式：
                                                                         //n=<几个> | 类名 c=<经过Arrange几次> x=<排版器给它的X(1/100 DIP，相对任务栏左沿)> w=<宽(1/100 DIP)> p=<直系父亲的类名>
                                                                         //只收 Taskbar. 开头的那一族（应用图标/托盘/飞岛宿主都在这一族），每个名字只在第一次见到时写一行，之后这一行不再动。
@@ -38,8 +38,10 @@ static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ
 // 助手 -> 插件：下面这一个是方案 B 新加的（居中的那一刀下在应用图标组身上）
 //应用图标那一组"整组居中"的现场（方案 B 剩下的唯一一件系统自己做不到的事）。
 //偏移 = (panel - width)/2 - left，同一个偏移加在这一组每个按钮转发的矩形上，所以组内间距还是系统排的那份。
-//n=上一趟这一组有几个按钮，left=整组左沿(1/100 DIP，相对任务栏左沿)，width=整组宽，panel=折半对着的那个数（任务栏窗口的宽，竖排时是高），d=最后一次真正加上去的偏移，lim=这一趟真实排到的最右沿到面板边还剩多少余量，sz=最后一次命中元素自己的宽(1/100 DIP)，wide=因为"宽得不像按钮"被拒绝下刀的次数，axis=h|v。
+//n=上一趟这一组有几个按钮，left=整组左沿(1/100 DIP，相对任务栏左沿)，width=整组宽，panel=折半对着的那个数（任务栏窗口的宽，竖排时是高），d=最后一次真正加上去的偏移，lim=这一趟真实排到的最右沿到面板边还剩多少余量，sz=最后一次命中元素自己的宽(1/100 DIP)，wide=因为"宽得不像按钮"被拒绝下刀的次数，ph=因为"负坐标/零宽"被挡掉的幽灵排布次数，axis=h|v。
 //怎么读：压根没有这一行 = 白名单一个都没命中，别猜，去看 TaskbarSplitClasses，那一行才是"应用按钮到底叫什么"的答案；
+//left 是几万位的负数 / width=0 / lim 大得离谱 = 记账被 ItemsRepeater 的幽灵排布污染了（那一趟根本没排真的按钮），
+//     现在这种排布直接挡在记账外面（ph 会涨），不再参与居中；
 //n=1 = 只开着一个窗口，本来就没有"组"可居中；width 明显比屏幕上那一排窄 = 有按钮没被算进来，居中一定偏；
 //sz 接近一个按钮的宽（几十 DIP）= 刀下在按钮身上；sz 上百 DIP 且 wide 一直涨 = 名单命中的是装着整排的容器，
 //     这时候整组不挪（宁可不居中），改法是把名单收到容器里面那一层，看 Classes 的 p= 就知道差哪一层；

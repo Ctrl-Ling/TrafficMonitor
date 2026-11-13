@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-13 08:23:18 +08:00
+// Last Modified At: 2026-11-13 09:06:28 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -685,9 +685,26 @@ static VisibleSpan VisibleSpanDip(FrameworkElement const& element, double fallba
     //剩下那种（拿不到 peer / 拿不到任务栏 / 数离谱）才是真的没量到，退回排版矩形，行为跟以前一样。
     if (peer_ok && frame_ok)
     {
-        if (out_visible != nullptr)
-            *out_visible = false;
-        return span;
+        //原来这里一律判"不占位"，把开始和多任务两格直接抹成 0（现场 s=0 tv=0 就是这么来的）：
+        //这两个按钮的 peer 报的是整块内容宿主的坐标（开始菜单、多任务视图那两岛就挂在它们身上），
+        //中心点落在任务栏那条带子外面，于是一个边界都并不进来 —— 可"量不到"不等于"不占位"。
+        //所以再问元素自己一句：Visible 且有宽度，就是明明在屏幕上，交回排版矩形当边界；
+        //只有元素自己也说不占位（折叠着、0 宽）才真的抹格子。
+        bool occupies = false;
+        try
+        {
+            occupies = (element.Visibility() == Visibility::Visible) && element.ActualWidth() > 0.5;
+        }
+        catch (...)
+        {
+            occupies = false;
+        }
+        if (!occupies)
+        {
+            if (out_visible != nullptr)
+                *out_visible = false;
+            return span;
+        }
     }
 
     span.ok = true;
@@ -821,6 +838,7 @@ static bool g_app_group_vertical{ false };     //最后一次量到的轴向（�
 static double g_app_group_limit_dip{ 0.0 };    //这一组排完还剩多少可挪的余量（面板边到最右沿），偏移被它卡住时 lim 就是负数/0
 static double g_app_group_size_dip{ 0.0 };     //最后一次命中元素自己的宽（1/100 DIP）：sz 小=打在按钮上，sz 大=打在容器上
 static long g_app_group_too_wide{ 0 };         //因为"宽得不像一个按钮"而拒绝下刀的次数（wide 涨=名单命中了容器那一层）
+static long g_app_group_phantom{ 0 };          //ItemsRepeater 回收/虚拟化时那种"负坐标或零宽"的幽灵排布，被挡掉的次数
 
 static bool IsAppIconButton(std::wstring const& class_name)
 {
@@ -844,7 +862,7 @@ static void PublishAppGroup(double panel_dip)
         return;     //一个都没命中：别写一行全是 0 的数骗人去看，Classes 那行才是这一轮的正确答案
 
     wchar_t buf[192]{};
-    ::swprintf_s(buf, L"n=%d left=%d width=%d panel=%d d=%d lim=%d sz=%d wide=%d axis=%s",
+    ::swprintf_s(buf, L"n=%d left=%d width=%d panel=%d d=%d lim=%d sz=%d wide=%d ph=%d axis=%s",
         g_app_group_count,
         static_cast<int>(std::lround(g_app_group_left_dip * 100.0)),
         static_cast<int>(std::lround((g_app_group_right_dip - g_app_group_left_dip) * 100.0)),
@@ -853,6 +871,7 @@ static void PublishAppGroup(double panel_dip)
         static_cast<int>(std::lround(g_app_group_limit_dip * 100.0)),
         static_cast<int>(std::lround(g_app_group_size_dip * 100.0)),
         static_cast<int>(g_app_group_too_wide),
+        static_cast<int>(g_app_group_phantom),
         g_app_group_vertical ? L"v" : L"h");
 
     //拼好的串和上次一模一样就不进注册表：SplitRegWriteStringIfChanged 是"每次调用都开一次键查一遍"，
@@ -899,6 +918,20 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
     const double size = vertical ? static_cast<double>(rect.Height) : static_cast<double>(rect.Width);
     *out_panel = panel_dip;
     g_app_group_size_dip = size;
+
+    //先把"幽灵排布"挡在记账外面——这一条才是图标整排消失的真凶（现场：left=-1004400、width=0、lim=1158000）。
+    //应用按钮的容器是 ItemsRepeater，它回收/虚拟化容器时会把某个 TaskListButton 排到一个极远的负坐标上、
+    //宽度给成 0：这一下既命中白名单、又长得像"整组最左边那个按钮"，于是整组左沿变成 -10044 DIP，
+    //折半算出来的偏移上万；lim 那道闸也一起坏掉，因为它拿的就是"这一趟的最右沿"，
+    //被幽灵拖到负数以后余量算成 11580 DIP，等于没闸——整排图标就被推到面板外面，屏幕上"图标没了"。
+    //判据只用已经在手的两个数，不问名字：宽不到半个 DIP、或者位置压根不在面板里，就不是一次屏幕上的摆放，
+    //既不记账也不挪（宁可不居中），ph= 记一笔。
+    if (size < 0.5 || pos < 0.0 || pos >= panel_dip)
+    {
+        g_app_group_phantom++;
+        PublishAppGroup(panel_dip);
+        return true;      //是应用按钮，但这一次不是它在屏幕上的位置：原样交回，什么都不动
+    }
 
     //名单有可能整个打在"装着所有应用按钮的那个容器"上：Classes 里按钮一层和容器一层常常都带
     //Taskbar. 这一族的名字，光看名字分不出来。打在容器上会同时坏两件事——
@@ -1121,8 +1154,13 @@ static bool ForgetAbsentButtons(std::vector<PinnedChild> const& children)
 
 static double MaxBlockEnd()
 {
+    //块宽只取左侧那一块的三格：开始 / 搜索 / 多任务视图。
+    //小组件这一格先不并进来，因为它到底排在哪儿现在还没量到过（上一版它一直是 w=0，
+    //判据刚修好，下一轮才有数）：万一系统把它排在应用列表后面甚至右侧，
+    //并进来就等于把 TM 一口气顶到托盘跟前——那是比"压住按钮"严重得多的坏。
+    //它自己的边界照旧报在 TaskbarSplitEdges 的 w= 里，那一行有数了再决定要不要并。
     double block = 0.0;
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 3; i++)
     {
         const double edge = g_button_right_edge_dip[i].load();
         if (edge > block)
