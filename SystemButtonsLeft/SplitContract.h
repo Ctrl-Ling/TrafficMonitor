@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-13 10:25:50 +08:00
+// Last Modified At: 2026-11-13 15:22:58 +08:00
 #pragma once
 #include <windows.h>
 
@@ -29,7 +29,7 @@ static constexpr const wchar_t* kRegWnd = L"TaskbarSplitWnd";           //REG_SZ
 static constexpr const wchar_t* kRegAckSeq = L"TaskbarSplitAckSeq";     //REG_DWORD 助手已经处理完的请求序号（等于 kRegReqSeq 表示这一轮做完了）
 static constexpr const wchar_t* kRegActive = L"TaskbarSplitActive";     //REG_DWORD 1：助手已在当前 explorer.exe 里挂钩成功
 static constexpr const wchar_t* kRegPid = L"TaskbarSplitPid";           //REG_DWORD 助手所在进程（explorer）的ID
-static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的右边界，单位 1/100 DIP（= 开始/搜索/多任务视图 三格里最右边那格的"看得见"右边界，不是排版矩形——排版矩形和屏幕上那块差一两个按钮位，TM 任务栏窗口就紧跟在这条线后面。小组件那一格暂时不并进来：它排在哪儿还没量准，误并会把 TM 顶到托盘跟前，等 TaskbarSplitEdges 的 w= 有数了再定）
+static constexpr const wchar_t* kRegBlock = L"TaskbarSplitBlock";       //REG_DWORD 左侧系统按钮块的右边界，单位 1/100 DIP（= 开始/搜索/多任务视图 三格里最右边那格的"看得见"右边界，不是排版矩形——排版矩形和屏幕上那块差一两个按钮位；小组件被钉进这一组时，还要再并上"钉好以后的天气内容右沿"，见 TaskbarSplitEdges 的 wp=。TM 任务栏窗口就紧跟在这条线后面。小组件没钉成的那一轮 wp=0，块宽就还是三格那条线）
 static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ 助手看到的"不是那四个系统按钮"的控件类型名，格式：
                                                                         //n=<几个> | 类名 c=<经过Arrange几次> x=<排版器给它的X(1/100 DIP，相对任务栏左沿)> w=<宽(1/100 DIP)> p=<直系父亲的类名>
                                                                         //只收 Taskbar. 开头的那一族（应用图标/托盘/飞岛宿主都在这一族），每个名字只在第一次见到时写一行，之后这一行不再动。
@@ -65,6 +65,11 @@ static constexpr const wchar_t* kRegEdges = L"TaskbarSplitEdges";       //REG_SZ
                                                                         //小组件那一位量的是天气图标+温度文字（按钮边界右边那 100 像素是没画东西的点击热区，按边界报块宽会把 TM 顶到应用图标上）。
                                                                         //这一行是"开关小组件后 TM 贴不贴得回去"的唯一现场：ev 不涨=压根没被叫醒（现在还有另一条节拍：左侧三个按钮每次排版都会复核小组件那一格，见 TaskbarSplit.cpp 的 RefreshWidgetsSlotFromSiblings）；w 不降且 why=0=眼神还不够，看 ld/vis/pv/pw 哪个不对再加判据。
                                                                         //块宽只有一个数，"某个按钮没报上来"和"某个按钮报大了"看着一样，靠这四格一次分清；开关小组件后这一行动不动，分的又是"事件没来"和"来了没量到"。
+//ws=/wp=/wl=/wb= 是"把小组件钉进左侧块"那一刀的现场(1/100 DIP)：ws=现在生效的平移（负数=往左钉，0=这一轮没钉），
+//wp=钉好以后 TM 跟的那个右沿（wp=0 表示没钉，块宽还是左侧三格那条线），wl=按钮自己的可见左沿（已减掉平移=系统原来排的那份，
+//没钉的时候它是个大数，就是它在右侧托盘前面），wb=按钮自己的可见宽（含右边那段空白热区）。
+//读法：wl 大、ws=0 = 缝不够宽（应用图标那排太靠左）或 peer 没量到，故意不钉；ws 正常而屏幕上小组件还在右边 = 平移没落到元素上；
+//wp 比 tv 只大几十 DIP = 钉对了，TM 紧跟在天气文字后面。
 static constexpr const wchar_t* kRegBuild = L"TaskbarSplitBuild";       //REG_SZ 助手 DLL 的编译时间戳。
                                                                         //explorer 里可能还挂着上一版的镜像（文件换了、进程没换），看这一行就知道正在跑的到底是哪一版
 static constexpr const wchar_t* kRegStep = L"TaskbarSplitStep";         //REG_DWORD 助手走到哪一步了（见下面的 kStep*），插件选项对话框直接显示这句话

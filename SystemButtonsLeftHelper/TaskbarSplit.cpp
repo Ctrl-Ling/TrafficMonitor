@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-13 10:25:50 +08:00
+// Last Modified At: 2026-11-13 15:22:58 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -132,6 +132,16 @@ static std::vector<winrt::weak_ref<FrameworkElement>> g_widgets_watched_up;
 //12 层是留的余量：任务栏那棵树光按钮外面就套着 presenter/面板/根好几种壳，
 //收起来的那一层到底在第几层没实测过，宁多勿少（这一层循环一次就是一个 GetParent，不花钱）。
 static constexpr int kWidgetsAncestorWalk = 12;
+//【小组件钉进左侧块】现场值（DIP）。
+//为什么这一段是新的一刀：TaskbarAl=0 只管把开始/搜索/多任务那一组挪到最左边，
+//小组件这颗按钮系统照样排在右侧、托盘前面（11-13 他那张截图 + Edges 现场都证实了）。
+//他要的顺序是 开始、搜索、多任务、小组件、TM，所以小组件必须自己往左挪，挪完 TM 才跟得上。
+//g_widgets_shift_dip 是"现在生效的那一刀"：下一刀必须先把量到的位置减掉它才是系统原来排的那份，
+//否则就是拿自己的结果当输入 —— 一帧往左一帧往右摆，那是反馈回路，不是收敛。
+static std::atomic<double> g_widgets_shift_dip{ 0.0 };       //现在生效的平移（负数=往左钉）
+static std::atomic<double> g_widgets_pin_right_dip{ 0.0 };   //钉好以后天气内容（图标+温度文字）的右沿，TM 跟在这个数后面；0=这一轮没钉
+static std::atomic<double> g_widgets_btn_left_dip{ 0.0 };    //诊断：按钮自己的可见左沿，已减掉平移=系统原来排的那份
+static std::atomic<double> g_widgets_btn_width_dip{ 0.0 };   //诊断：按钮自己的可见宽（含右边那段没画东西的热区）
 static thread_local bool g_in_hook{ false };
 
 //【片4 · 先认名字，再谈居中】把"不是那四个系统按钮"的控件类型名报出来。
@@ -1113,6 +1123,12 @@ static void ResetAppGroupAccounting()
     g_app_group_limit_dip = 0.0;
     g_app_group_offset_dip = 0.0;
     g_app_group_calib = 0;
+    //小组件那一刀和居中那一刀是同一批下出去的，清零必须一起清：
+    //留着旧平移，下次开启第一帧就按"已经钉过去了"的位置再钉一次，整颗按钮往左多跑一格。
+    g_widgets_shift_dip = 0.0;
+    g_widgets_pin_right_dip = 0.0;
+    g_widgets_btn_left_dip = 0.0;
+    g_widgets_btn_width_dip = 0.0;
 }
 
 //四个按钮各自报上来的右边沿，一行写清楚。为什么要这一行：块宽只有一个数，
@@ -1134,10 +1150,15 @@ static void ResetAppGroupAccounting()
 //搜索切成"图标和标签"时 dw 的第二位应当从 ~10600 跳到 ~22400，
 //没跳就是那一格压根没量到可见宽度（peer 拿不到），这一行会退回显示排版矩形的数，src= 也跟着变成 rect。
 //小组件那一格（dw 最后一位）量的是天气图标+温度文字，不含按钮右边那段没画东西的热区。
+//ws=/wp=/wl=/wb= 是"把小组件钉进左侧块"那一刀的现场（都是 1/100 DIP）：
+//ws= 现在生效的平移（负数=往左钉，0=这一轮没钉）；wp= 钉好以后 TM 跟的那个右沿，wp=0 就是没钉、TM 还是跟左侧三格；
+//wl= 按钮自己的可见左沿（已减掉平移，就是系统原来排的那份，右侧时应当是个大数）；wb= 按钮自己的可见宽。
+//怎么读：ws=0 且 wl 很大 = 缝不够宽（应用图标那排太靠左）或者 peer 没量到，故意不钉，去看 room 那两个数；
+//ws 正常但屏幕上小组件还在右边 = 平移没落到元素上；wp 比 tv 只大一点点 = 钉对了、TM 紧跟在天气文字后面。
 static void PublishEdges()
 {
-    wchar_t edges[256]{};
-    ::swprintf_s(edges, L"s=%d se=%d tv=%d w=%d src=%s n=%d/%d/%d/%d ev=%d vis=%d aw=%d why=%d pv=%d pw=%d ld=%d ms=%d dw=%d/%d/%d/%d",
+    wchar_t edges[320]{};
+    ::swprintf_s(edges, L"s=%d se=%d tv=%d w=%d src=%s n=%d/%d/%d/%d ev=%d vis=%d aw=%d why=%d pv=%d pw=%d ld=%d ms=%d dw=%d/%d/%d/%d ws=%d wp=%d wl=%d wb=%d",
         static_cast<int>(std::lround(g_button_right_edge_dip[0].load() * 100.0)),
         static_cast<int>(std::lround(g_button_right_edge_dip[1].load() * 100.0)),
         static_cast<int>(std::lround(g_button_right_edge_dip[2].load() * 100.0)),
@@ -1158,7 +1179,11 @@ static void PublishEdges()
         static_cast<int>(std::lround(g_button_visible_width_dip[0].load() * 100.0)),
         static_cast<int>(std::lround(g_button_visible_width_dip[1].load() * 100.0)),
         static_cast<int>(std::lround(g_button_visible_width_dip[2].load() * 100.0)),
-        static_cast<int>(std::lround(g_button_visible_width_dip[3].load() * 100.0)));
+        static_cast<int>(std::lround(g_button_visible_width_dip[3].load() * 100.0)),
+        static_cast<int>(std::lround(g_widgets_shift_dip.load() * 100.0)),
+        static_cast<int>(std::lround(g_widgets_pin_right_dip.load() * 100.0)),
+        static_cast<int>(std::lround(g_widgets_btn_left_dip.load() * 100.0)),
+        static_cast<int>(std::lround(g_widgets_btn_width_dip.load() * 100.0)));
     SplitRegWriteStringIfChanged(kRegEdges, edges);
 }
 
@@ -1221,13 +1246,12 @@ static bool ForgetAbsentButtons(std::vector<PinnedChild> const& children)
     return changed;
 }
 
-static double MaxBlockEnd()
+//左侧那一块（开始/搜索/多任务）的右沿，不含小组件。
+//为什么必须和 MaxBlockEnd 分开：小组件钉进来以后它的右沿也要并进块宽，
+//而"钉到哪儿"用的必须是这块没含小组件时的右沿——两者混用一个函数，
+//下一帧就会拿"含了小组件的块宽"当目标，小组件一格一格往右爬，一直爬到应用图标跟前。
+static double LeftClusterEnd()
 {
-    //块宽只取左侧那一块的三格：开始 / 搜索 / 多任务视图。
-    //小组件这一格先不并进来，因为它到底排在哪儿现在还没量到过（上一版它一直是 w=0，
-    //判据刚修好，下一轮才有数）：万一系统把它排在应用列表后面甚至右侧，
-    //并进来就等于把 TM 一口气顶到托盘跟前——那是比"压住按钮"严重得多的坏。
-    //它自己的边界照旧报在 TaskbarSplitEdges 的 w= 里，那一行有数了再决定要不要并。
     double block = 0.0;
     for (int i = 0; i < 3; i++)
     {
@@ -1235,6 +1259,18 @@ static double MaxBlockEnd()
         if (edge > block)
             block = edge;
     }
+    return block;
+}
+
+static double MaxBlockEnd()
+{
+    //块宽 = 左侧三格的右沿，再加上"小组件真的被钉进来了"时那份当场算好的右沿。
+    //小组件那一格（g_button_right_edge_dip[3]）永远不进这里：它没钉的时候排在右侧托盘前面，
+    //并进来等于把 TM 一口气顶到托盘跟前——那是比"压住按钮"严重得多的坏（11-13 现场 w= 就是那个位置）。
+    double block = LeftClusterEnd();
+    const double pinned = g_widgets_pin_right_dip.load();
+    if (pinned > block)
+        block = pinned;
     return block;
 }
 
@@ -1291,6 +1327,70 @@ static void ClearBlockEnd(SystemButton button)
     if (g_button_right_edge_dip[index].load() == 0.0)
         return;
     g_button_right_edge_dip[index] = 0.0;
+    PublishBlockFromSlots();
+}
+
+//把小组件整颗按钮往左钉，钉到"开始/搜索/多任务"那一块的右沿上；钉好了把转发矩形改好交出去，钉不了就原样交回。
+//三个要点，每条都对应一个已经踩过的坑：
+//1) 平移量按屏幕口径算（UIA 边界），不按排版矩形。这颗按钮挂在右侧托盘那一层，
+//   它 rect.X 到屏幕之间隔着父容器的偏移（应用图标那组刚为这 22.8 DIP 踩过一次），
+//   拿 rect.X 折算就是另一套坐标里折中，永远差一截。
+//2) 算下一刀之前必须先把"现在生效的那一刀"减掉：peer 量到的是上一帧的结果，里面已经含着我们加的平移，
+//   直接 目标 - 量到的 就是反馈回路（一帧左一帧右摆）；减掉以后拿到的才是系统原来排的那份，一次就到位。
+//3) 下刀贴着按钮自己的可见左沿，不贴天气图标的左沿：图标在按钮里面还进去一小截（现场约 14 DIP），
+//   照图标对齐会把多任务视图右边那一窄条点区盖住——点多任务变成开小组件。
+//   TM 跟的是"内容右沿"（图标+温度文字）：按钮右边那段空白热区压在 TM 窗口底下不碍事，
+//   TM 是真窗口，自己收点击，比在小组件和 TM 之间空出 60 多 DIP 好看。
+//放不下就不钉：中间那条缝（左侧块右沿到已经居中的那排图标左沿）比按钮本身窄，
+//宁可按系统排的样子留在右边，也别和图标叠在一起。
+static void PinWidgetsLeft(FrameworkElement const& element, Rect const rect, Rect* io)
+{
+    g_widgets_pin_right_dip = 0.0;
+
+    bool visible = true;
+    const VisibleSpan btn = VisibleSpanDip(element,
+        static_cast<double>(rect.X) + rect.Width, &visible);
+    //必须是 peer 量出来的数才能钉：退回排版矩形时 left/width 全是 0，那是另一套坐标，算出来的刀能飞出去。
+    if (!btn.ok || !btn.from_uia || !visible || btn.width <= 0.0)
+    {
+        g_widgets_shift_dip = 0.0;
+        return;
+    }
+
+    const double unshifted_left = btn.left - g_widgets_shift_dip.load();
+    g_widgets_btn_left_dip = unshifted_left;
+    g_widgets_btn_width_dip = btn.width;
+
+    const double block_end = LeftClusterEnd();
+    if (!std::isfinite(block_end) || block_end <= 0.0)
+    {
+        g_widgets_shift_dip = 0.0;
+        return;     //左侧三格还没量到：连钉到哪儿都不知道，不动
+    }
+
+    //中间那条缝有多宽：应用组的屏幕左沿 = 校准后的整组左沿 + 这一趟生效的偏移（两个都是屏幕口径）。
+    //这一格还没量过（应用一个没开）时缝就是整条任务栏，照样钉得进去。
+    const double app_left = g_app_group_left_dip + g_app_group_delta_dip;
+    const double room = (app_left > block_end && std::isfinite(app_left)) ? (app_left - block_end) : 0.0;
+    if (btn.width > room)
+    {
+        g_widgets_shift_dip = 0.0;
+        return;
+    }
+
+    const double delta = block_end - unshifted_left;
+    g_widgets_shift_dip = delta;
+    io->X = static_cast<float>(static_cast<double>(io->X) + delta);
+
+    //TM 跟的右沿：内容在按钮里进去多少、内容本身多宽，这两个差值平移前后都一样，
+    //所以拿现场那两个数当场相减就行，不用再去猜"钉好以后会在哪儿"。
+    const int w_index = static_cast<int>(SystemButton::Widgets);
+    const double content_left = g_button_visible_left_dip[w_index].load();
+    const double content_width = g_button_visible_width_dip[w_index].load();
+    if (content_width > 0.0 && content_left >= btn.left - 1.0)
+        g_widgets_pin_right_dip = block_end + (content_left + content_width - btn.left);
+    else
+        g_widgets_pin_right_dip = block_end + btn.width;    //叶子量不到（模板换了/折叠中）就按整颗按钮宽算，宁可空一点也别压住
     PublishBlockFromSlots();
 }
 
@@ -1701,8 +1801,9 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
             RememberTouched(element);
             //从此以后这一格不再只靠排版轮次：元素自己会报"我变了/我不在了"
             WatchWidgetsEvents(element);
-            //B 路线里小组件由系统自己排在最左边那一组的末尾，不再需要正左边距；
-            //这里只擦旧版可能留在树上的那一份（见 ClearStaleWidgetsOffset）
+            //旧版（居中标本）靠正左边距挪它，那份边距要是还挂在树上，会和下面那一刀叠成两次平移，先擦掉。
+            //11-13 现场确认：TaskbarAl=0 时系统把小组件排在右侧托盘前面（wl 是个大数），
+            //所以"开始、搜索、多任务、小组件、TM"这个顺序里，只有小组件这一格是系统自己不肯挪的，必须下刀。
             if (StaleWidgetsOffset(element))
                 PostToTaskbarThread(element, ClearStaleWidgetsOffset);
             //小组件是这一组里最右边的一个，块宽基本就是它的右边沿。
@@ -1722,9 +1823,22 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
                 //省得两处判据以后各改各的）。这里把排版矩形交进去当兜底：
                 //UIA 拿不到边界时才用它，拿得到的一律用"看得见的边界"。
                 RepublishWidgetsEdge(element, static_cast<double>(rect.X) + rect.Width);
+
+                //【这一格的新刀】把它从右侧托盘前面钉到左侧块尾巴上，钉完 TM 才排在它后面。
+                Rect forwarded = rect;
+                PinWidgetsLeft(element, rect, &forwarded);
+                return g_arrange_original(p_this, forwarded);
             }
             else
+            {
                 ClearBlockEnd(SystemButton::Widgets);
+                //关掉功能：平移只写在转发矩形里，下一帧交回的就是系统那份 X，当场自己复原；
+                //这里清的是记账，省得下次开启时第一帧用着上一轮的旧平移算刀。
+                g_widgets_shift_dip = 0.0;
+                g_widgets_pin_right_dip = 0.0;
+                g_widgets_btn_left_dip = 0.0;
+                g_widgets_btn_width_dip = 0.0;
+            }
             return g_arrange_original(p_this, rect);
         }
 
