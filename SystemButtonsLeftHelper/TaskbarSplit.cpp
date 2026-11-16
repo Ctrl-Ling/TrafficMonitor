@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-16 12:23:45 +08:00
+// Last Modified At: 2026-11-16 15:04:59 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -497,6 +497,20 @@ static bool TrayFrame(RECT* out_rc, UINT* out_dpi)
     return true;
 }
 
+//一块边界落在哪种"任务栏带子"里：1=屏幕带子（中心点在 Shell_TrayWnd 上下之间）
+//2=岛内带子（坐标原点在岛顶，中心点在 0~带高之间）0=都不在（整屏内容岛就是这种）。
+//判据只写这一处，量取（BoundsRejectReason）和取证（CollectPeerEvidence）共用，别再各算一遍算出两个答案。
+static int BoundsBandSpace(Rect const& bounds, RECT const& tray_rc)
+{
+    const double tray_band = static_cast<double>(tray_rc.bottom) - static_cast<double>(tray_rc.top);
+    const double mid_y = static_cast<double>(bounds.Y) + bounds.Height / 2.0;
+    if (mid_y >= static_cast<double>(tray_rc.top) && mid_y < static_cast<double>(tray_rc.bottom))
+        return 1;
+    if (mid_y >= 0.0 && mid_y < tray_band)
+        return 2;
+    return 0;
+}
+
 //一段 peer 边界能不能算"任务栏带子里的一块"：0=能收，其余是卡在哪儿（1=宽高为 0 2=坐标离谱
 //3=中心点不在带子里 4=比带子高或比窗口宽 5=单块占掉三分之一条任务栏）。
 //为什么单独折出来：钉位、校准、块宽全都卡在这几句判据上，一旦"屏幕口径为什么一直失灵"就必须说清
@@ -509,6 +523,9 @@ static int BoundsRejectReason(Rect const& bounds, RECT const& tray_rc, UINT dpi,
         return 1;
 
     const double scale = 96.0 / dpi;
+    //减掉窗口左沿这一步对"岛内"那套口径也成立：主任务栏的岛就铺满 Shell_TrayWnd，
+    //岛原点的 x 就是窗口左沿（现场 tr=0,…，本来就是 0），两种口径折出来同一个数。
+    //只有 y 差一个窗口顶，而 y 不参与左右边界，只用上面那道带子判据。
     const double left = (static_cast<double>(bounds.X) - tray_rc.left) * scale;
     const double right = (static_cast<double>(bounds.X) + bounds.Width - tray_rc.left) * scale;
     //任务栏再宽也不会到十万 DIP，越界说明这个版本的 peer 给的坐标不是这个意思
@@ -517,12 +534,23 @@ static int BoundsRejectReason(Rect const& bounds, RECT const& tray_rc, UINT dpi,
     //只算"竖着落在任务栏那一条里"的：往下并孩子的时候，模板里可能挂着开始菜单/搜索面板那种
     //整屏大的内容宿主（它也在视觉树上，但它是弹出来的岛），并进来的话这一格会一口气报出半屏宽，
     //TM 直接被顶到屏幕中间去。判据就用最直白的：这块的中心点得在任务栏那条带子里。
-    const double mid_y = static_cast<double>(bounds.Y) + bounds.Height / 2.0;
-    if (mid_y < static_cast<double>(tray_rc.top) || mid_y >= static_cast<double>(tray_rc.bottom))
+    //【11-16 现场定案：带子有两种坐标口径，只认屏幕那一种把每一格全拒了】
+    //TaskbarSplitPeerEvidence 原文：W 段 bd=1279,0,190,60、A 段 bd=630,0,55,60，
+    //而 tr=0,1020,1920,1080、dpi=120（缩放 1.25）、xywh=1023,0,152,48 和 504,0,44,48。
+    //把 peer 那份除以 1.25：1279/1.25=1023.2、630/1.25=504、190/1.25=152、55/1.25=44 ——
+    //和 TransformToVisual(根) 的数一位不差，只有 y 恒为 0。
+    //所以这一版 peer 给的不是屏幕坐标，是"岛内"坐标：岛顶（=任务栏窗口顶）就是 y=0，
+    //屏幕上的 1020 根本不会出现在 bd.y 里。原来第 3 道拿 1020 当下界，于是 rj=3 全灭，
+    //src= 永远 rect、cal= 永远 0、ws=0 wl=0 wb=0 wr=1 —— 钉位和校准一起开不了工。
+    //现在两种口径都认：中心点落在屏幕带子里，或者落在"岛内 0~带高"里。
+    //整屏那种内容岛照样拦得住：它的中心点 540 既不在 1020~1080、也不在 0~60，
+    //而且下面第 4、5 道（比带子高/比窗口宽/单块占掉三分之一条）各还会再拒一次。
+    const double tray_band = static_cast<double>(tray_rc.bottom) - static_cast<double>(tray_rc.top);
+    const int band_space = BoundsBandSpace(bounds, tray_rc);
+    if (band_space == 0)
         return 3;
     //再加两道硬边：比任务栏窗口本身还高或还宽的，一定不是这条带子里的一块（内容岛就是整屏）。
     //这两条拦不到任何按钮：按钮比带子矮、比窗口窄。
-    const double tray_band = static_cast<double>(tray_rc.bottom) - static_cast<double>(tray_rc.top);
     const double tray_span = static_cast<double>(tray_rc.right) - static_cast<double>(tray_rc.left);
     if (static_cast<double>(bounds.Height) > tray_band || static_cast<double>(bounds.Width) > tray_span)
         return 4;
@@ -540,12 +568,12 @@ static int BoundsRejectReason(Rect const& bounds, RECT const& tray_rc, UINT dpi,
 
 //把一段物理像素边界并进 span（相对任务栏左沿、按窗口 DPI 折算成 DIP）。
 //宽或高为 0 = 这块现在看不见，不收。
-//【11-16 现场】src= 永远 rect、cal= 永远 0、ws= 永远 0 —— 一句判据都没放行过。
-//小组件那颗按钮的 peer 报的是一整块屏幕（X=0、Y=0、宽约 1920、高约 1080 这种），中心点 y=540
-//落在带子外面，第 3 道就把整屏岛拒了：拒得对，但它把"屏幕那把尺子"一起废了 ——
-//这一格再也没有可用边界，VisibleSpanDip 只能退回排版矩形，钉位和校准全都开不了工。
-//所以这次除了判据，还把 peer 报回的原始数写进 TaskbarSplitPeerEvidence（bd=）：
-//到底是"坐标口径不对（Y 是个位数）"还是"真的报了整屏"，下一次现场一行就能看出来，别再靠猜。
+//【11-16 现场定案】上一版这里写的是"peer 报的是一整块屏幕"，那句话是我猜的、而且猜错了：
+//证据行里 bd 的 x/宽/高和 TransformToVisual 的数按 1.25 缩放完全对得上、y 恒为 0 ——
+//peer 报的是"岛内"坐标（原点=岛顶），不是屏幕坐标，也不是整屏；
+//被第 3 道按屏幕带子拒了以后，src=/cal=/ws= 才一起全灭。
+//判据现在两种口径都认（BoundsBandSpace），原始数照旧抄进 TaskbarSplitPeerEvidence（bd= 加 sp=）：
+//哪一天系统又换口径，sp=0 一行就能看出来，不用再靠推。
 static bool UnionBoundsIntoSpan(Rect const& bounds, RECT const& tray_rc, UINT dpi, VisibleSpan* io)
 {
     double left = 0.0;
@@ -787,6 +815,7 @@ struct PeerEvidence
     int tf_ok = 0;            //TransformToVisual(根) 走通了没有
     long fx = 0, fy = 0, fw = 0, fh = 0;    //元素在"根那一层"的位置和大小（DIP）
     int depth = 0;            //往上走了几层才到根（顺便说明这棵树有多深）
+    int space = 0;            //peer 那份边界落在哪种带子里：1=屏幕带子 2=岛内带子（y 从岛顶算）0=都不在
 };
 static PeerEvidence g_peer_widgets;
 static PeerEvidence g_peer_app;
@@ -819,6 +848,9 @@ static void CollectPeerEvidence(FrameworkElement const& element, PeerEvidence* o
             out->bw = static_cast<long>(std::lround(b.Width));
             out->bh = static_cast<long>(std::lround(b.Height));
             out->reject = BoundsRejectReason(b, tray_rc, dpi, nullptr, nullptr);
+            //顺手把"这份边界落在哪种带子里"抄一份：1=屏幕 2=岛内 0=都不在。
+            //11-16 就是靠这一句把"屏幕那把尺子为什么全灭"从猜变成看（当时全是 0）。
+            out->space = BoundsBandSpace(b, tray_rc);
         }
     }
     catch (hresult_error const& e)
@@ -831,8 +863,9 @@ static void CollectPeerEvidence(FrameworkElement const& element, PeerEvidence* o
     }
 
     //第二套口径：XAML 自己认为这个元素在根的哪儿。这条完全不碰 UIA，
-    //如果它给出的 y 是个位数、而 peer 给出的 y 是一千多，两套坐标差的就是"窗口原点"，
-    //屏幕那把尺子要怎么折算当场就有答案（应用图标那 22.8 DIP 就是这类差值）。
+    //11-16 就是这一列把病根定下来的：xywh 的 1023/504 和 bd 的 1279/630 差一个 1.25 缩放、
+    //y 两边都是 0，说明 peer 那份和 XAML 这份是同一个空间（原点=岛顶），只是乘了物理像素，
+    //带子判据据此改成"屏幕带子或岛内带子都认"（见 BoundsBandSpace）。
     try
     {
         FrameworkElement root = element;
@@ -872,9 +905,10 @@ static void PublishPeerEvidence()
 {
     wchar_t buf[512]{};
     ::swprintf_s(buf,
-        L"W pk=%d tfok=%d bs=%d rj=%d bd=%d,%d,%d,%d tr=%d,%d,%d,%d dpi=%d hr=%x xywh=%d,%d,%d,%d dp=%d"
-        L" | A pk=%d tfok=%d bs=%d rj=%d bd=%d,%d,%d,%d tr=%d,%d,%d,%d dpi=%d hr=%x xywh=%d,%d,%d,%d dp=%d",
+        L"W pk=%d tfok=%d bs=%d rj=%d sp=%d bd=%d,%d,%d,%d tr=%d,%d,%d,%d dpi=%d hr=%x xywh=%d,%d,%d,%d dp=%d"
+        L" | A pk=%d tfok=%d bs=%d rj=%d sp=%d bd=%d,%d,%d,%d tr=%d,%d,%d,%d dpi=%d hr=%x xywh=%d,%d,%d,%d dp=%d",
         g_peer_widgets.peer_created, g_peer_widgets.tf_ok, g_peer_widgets.bounds_seen, g_peer_widgets.reject,
+        g_peer_widgets.space,
         static_cast<int>(g_peer_widgets.bx), static_cast<int>(g_peer_widgets.by),
         static_cast<int>(g_peer_widgets.bw), static_cast<int>(g_peer_widgets.bh),
         static_cast<int>(g_peer_widgets.tl), static_cast<int>(g_peer_widgets.tt),
@@ -883,6 +917,7 @@ static void PublishPeerEvidence()
         static_cast<int>(g_peer_widgets.fx), static_cast<int>(g_peer_widgets.fy),
         static_cast<int>(g_peer_widgets.fw), static_cast<int>(g_peer_widgets.fh), g_peer_widgets.depth,
         g_peer_app.peer_created, g_peer_app.tf_ok, g_peer_app.bounds_seen, g_peer_app.reject,
+        g_peer_app.space,
         static_cast<int>(g_peer_app.bx), static_cast<int>(g_peer_app.by),
         static_cast<int>(g_peer_app.bw), static_cast<int>(g_peer_app.bh),
         static_cast<int>(g_peer_app.tl), static_cast<int>(g_peer_app.tt),
@@ -1321,7 +1356,9 @@ static void ResetAppGroupAccounting()
 //wr= 为什么没钉（0=钉成了 1=这一格没量到屏幕边界 2=左侧三格没量到 3=中间那条缝比"让位+内容宽"还窄）：
 //    ws=0 这一种样子背后是三个完全不同的病，11-16 那次就是靠"ws=0 + src=rect"才反推出来的，
 //    中间白白绕了一轮猜测——现在一个数直接说清楚，不用再推。
-//怎么读：wr=1 且 src=rect = 屏幕那把尺子又失灵了（多半是某层 peer 报了整屏边界，回去看 UnionBoundsIntoSpan）；
+//怎么读：先看在带子里没有——src=rect 且 wr=1 说明屏幕口径又空了，这时去看
+//TaskbarSplitPeerEvidence：bs=0 是没返回、hr 非 0 是抛了、rj 非 0 是被哪一道拒了、sp=0 是坐标口径又换了
+//（11-16 那次就是 sp=0/rj=3：peer 给的是岛内坐标，y 恒为 0，屏幕带子把它全拒了）。
 //wr=3 = 应用图标那排太靠左，缝真不够，故意不钉；ws 正常但屏幕上小组件还在右边 = 平移没落到元素上；
 //wp 比 tv 只大一点点 = 钉对了、TM 紧跟在天气文字后面。
 static void PublishEdges()
@@ -1528,8 +1565,8 @@ static void PinWidgetsLeft(FrameworkElement const& element, Rect const rect, Rec
     CollectPeerEvidence(element, &g_peer_widgets);
     PublishPeerEvidence();
 
-    //按钮自己那一层在带子里量到的块。整屏大的内容岛已经被 UnionBoundsIntoSpan 那三道硬边挡掉
-    //（11-16 现场就是它把屏幕口径全灭的：src=rect、cal=0、ws=0）。
+    //按钮自己那一层在带子里量到的块。整屏大的内容宿主由第 3~5 道挡掉（带子两种口径都认，
+    //但中心点 540 那种既不在屏幕带子也不在岛内带子，照样进不来）。
     const VisibleSpan measured = VisibleSpanDip(element,
         static_cast<double>(rect.X) + rect.Width, &visible);
     const bool measured_ok = measured.ok && measured.from_uia && visible && measured.width > 0.0;
@@ -1735,12 +1772,15 @@ static int WidgetsGoneReason(FrameworkElement const& element)
                 std::isfinite(bounds.Width) && std::isfinite(bounds.Height) &&
                 bounds.Width > 0.0 && bounds.Height > 0.0)
             {
+                //竖直方向的判据和量取共用同一条 BoundsBandSpace（屏幕带子、岛内带子两种口径都认）：
+                //11-16 现场 peer 给的是 bd.y=0 而 tr.top=1020，原来这一句只按屏幕那套算，
+                //bottom(60) <= tray.top(1020) 就把好好排在右侧的小组件判成"整块在任务栏外面"（why=3），
+                //那一格被抹掉，钉位拿不到锚点 —— 和 src=rect/cal=0 是同一个病根的第二处埋点。
+                //水平方向两套口径的左沿都是 tray.left（主任务栏就是 0），一句照旧够用。
                 const double right = static_cast<double>(bounds.X) + bounds.Width;
-                const double bottom = static_cast<double>(bounds.Y) + bounds.Height;
-                if (right <= static_cast<double>(tray_rc.left) ||
-                    static_cast<double>(bounds.X) >= static_cast<double>(tray_rc.right) ||
-                    bottom <= static_cast<double>(tray_rc.top) ||
-                    static_cast<double>(bounds.Y) >= static_cast<double>(tray_rc.bottom))
+                if (BoundsBandSpace(bounds, tray_rc) == 0 ||
+                    right <= static_cast<double>(tray_rc.left) ||
+                    static_cast<double>(bounds.X) >= static_cast<double>(tray_rc.right))
                     return 3;
             }
         }
@@ -2114,17 +2154,28 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
             RefreshWidgetsSlotFromSiblings();
         }
 
-        //块宽记的是这个按钮“看得见”的右边沿（排版矩形只当作拿不到 peer 时的兜底）：
-        //实测搜索那一格排出来宽是 0、多任务视图的可见图标比它的排版矩形整整右移一个按钮位，
-        //照着排版矩形报，块宽就永远比屏幕上的按钮窄一截，TM 的窗口会压住按钮。
+        //这一格块宽的历史：更早的版本只按排版矩形报，碰上"可见图标排在矩形外面"就把 TM 压到按钮上，
+        //所以上一版改成"看得见"的右沿、排版矩形只当拿不到 peer 时的兜底。
+        //11-16 屏幕口径活了以后再看这句：那三个按钮的排版右沿就是系统给的可点区右沿，
+        //光用可见右沿会把块收窄（TM 盖住按钮右边那条热区），所以现在改成两个取靠右的，理由见下面那段。
         //同一趟把可见的左沿和宽度也记下来（诊断里 dw= 那一行）：B 路线不再拿它排位，
         //但"眼睛量出来的"和"排版矩形"差多少，只有这一行能回答。
+        //块宽这一格取"排版右沿"和"可见右沿"里更靠右的那个，两个理由都要保住：
+        //1) 排版矩形是可点区域的右沿，只按可见图标报会把块收窄一截，TM 的窗口就压在按钮右边那条热区上
+        //   （11-16 现场 s=5520 se=9920 tv=14320 就是这一套数，TM 排在他确认没问题的那个位置）；
+        //2) 画在矩形外面的东西（旧版那种负边距、越界的图标）必须还能把块撑回去，这是老那句"块宽永远比屏幕窄一截"的保险。
+        //屏幕口径这次真的活了（sp=2），所以保险继续留着，但不再拿它单独决定块宽。
         bool visible = true;
         const double rect_edge = static_cast<double>(rect.X) + rect.Width;
         const VisibleSpan span = VisibleSpanDip(element, rect_edge, &visible);
         RecordButtonSpan(button, span);
         if (visible)
-            UpdateBlockEnd(button, span.right);
+        {
+            double edge = rect_edge;
+            if (span.ok && span.from_uia && span.right > edge)
+                edge = span.right;
+            UpdateBlockEnd(button, edge);
+        }
         else
             ClearBlockEnd(button);
 

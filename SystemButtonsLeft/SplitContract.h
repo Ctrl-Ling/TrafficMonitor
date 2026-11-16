@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-16 12:23:45 +08:00
+// Last Modified At: 2026-11-16 15:04:59 +08:00
 #pragma once
 #include <windows.h>
 
@@ -75,13 +75,16 @@ static constexpr const wchar_t* kRegEdges = L"TaskbarSplitEdges";       //REG_SZ
 //wp 比 tv 只大几十 DIP = 钉对了，TM 紧跟在天气文字后面。
 //【屏幕那把尺子为什么失灵，这一行直接给原样证据】W 段=小组件那颗按钮，A 段=新一趟最左那颗应用图标；
 //每段 pk=CreatePeerForElement 有没有给对象，tfok=XAML 自己那套坐标走通了没有，bs=GetBoundingRectangle 有没有返回，
-//rj=BoundsRejectReason 拒在第几道（-1 没问 0 放行 1 宽高为0 2 坐标离谱 3 中心点不在任务栏带子里 4 比带子高或比窗口宽 5 单块占掉三分之一条任务栏），
+//rj=BoundsRejectReason 拒在第几道（-1 没问 0 放行 1 宽高为0 2 坐标离谱 3 中心点不在带子里 4 比带子高或比窗口宽 5 单块占掉三分之一条任务栏），
+//sp=这份边界落在哪种带子里（1 屏幕带子 2 岛内带子=原点在即岛顶 0 都不在；判据见 BoundsBandSpace），
 //bd=peer 报的原始边界（物理像素，原样抄、不折算），tr=Shell_TrayWnd 的窗口矩形（物理像素），dpi=窗口 DPI，hr=抛出来的 hresult（十六进制，0=没抛），
 //xywh=TransformToVisual(视觉树根) 得到的位置和元素自己的 ActualWidth/Height（DIP），dp=往上走到根经过了几层。
-//怎么用：bd 的 y 是一千多（和 tr 的 top 同量级）= peer 报的就是屏幕坐标，那就是被 rj 拒了，改判据；
-//bd 的 y 是个位数而 xywh 的 y 也是 0 附近 = peer 报的是"它自己那个容器/岛"里的局部坐标，两套口径差一个窗口原点，必须换算；
-//pk=0 = 这颗按钮根本没有 automation peer，屏幕口径这条路在这台机器上直接不通，只能换 XAML 那套（xywh）；
-//hr!=0 = 问一次抛一次，记下错误码。
+//【11-16 定案，本机就是这个样子】W 段 bd=1279,0,190,60、A 段 bd=630,0,55,60，tr=0,1020,1920,1080、dpi=120、
+//xywh=1023,0,152,48 和 504,0,44,48：bd 除以 1.25 和 xywh 一位不差、y 恒为 0，
+//说明这一版 peer 报的是「岛内」坐标（原点=岛顶），不是屏幕坐标；当时 rj=3/sp=0 就是全灭的那道闸。
+//判据已经改成两种口径都认，所以正常情况下 sp=2、rj=0、src=uia、wr 不再是 1。
+//还怎么读：pk=0 = 这颗按钮没有 automation peer，屏幕这条路在这台机器上不通，只能换 xywh；
+//hr!=0 = 问一次抛一次，记下错误码；bd 的宽高和 xywh 对不上 = 系统又换了口径，按新的数重算带子。
 static constexpr const wchar_t* kRegPeerEvidence = L"TaskbarSplitPeerEvidence"; //REG_SZ 屏幕口径失灵的原始证据，见上面那段读法
 static constexpr const wchar_t* kRegBuild = L"TaskbarSplitBuild";       //REG_SZ 助手 DLL 的编译时间戳。
                                                                         //explorer 里可能还挂着上一版的镜像（文件换了、进程没换），看这一行就知道正在跑的到底是哪一版
