@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-16 15:04:59 +08:00
+// Last Modified At: 2026-11-16 15:09:14 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -1239,7 +1239,22 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
                 //平移量到"半个面板"以外就是没量对（这颗按钮这会儿不在任务栏那条带子里）：
                 //当没量到，维持老口径，宁可不居中也别把整组甩出屏。
                 if (candidate >= -panel_dip / 2.0 && candidate <= panel_dip / 2.0)
-                    offset = candidate;
+                {
+                    //【限速，11-16 下午新加】同一台机器、同一排按钮，隔了几分钟读到的两次现场差一颗的一半：
+                    //上一次 bd=630(=504 DIP) 说平移量 0，这一次 bd=603(=482 DIP) 说平移量 -22，
+                    //而 left/width/d 三个数两回完全一样 —— 说明这一趟第一个来排版的不是上一趟最左那颗
+                    //（ph= 已经从 9 涨到 40，幽灵趟每次都换人），candidate 就会跳半颗到一颗。
+                    //平移量 k 是容器几何定死的数，不该一帧换半颗：每趟最多挪一颗按钮宽，
+                    //第一趟就从 0 走到 -22（在限内），往后只在真变了时才动，甩飞整排的毛病进不去。
+                    const double step_limit = g_app_group_size_dip > 4.0 ? g_app_group_size_dip : 44.0;
+                    const double previous = g_app_group_offset_dip;
+                    double allowed = candidate;
+                    if (allowed < previous - step_limit)
+                        allowed = previous - step_limit;
+                    if (allowed > previous + step_limit)
+                        allowed = previous + step_limit;
+                    offset = allowed;
+                }
             }
             g_app_group_offset_dip = offset;
             g_app_group_left_dip = g_app_sweep_min_dip + offset;

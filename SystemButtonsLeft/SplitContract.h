@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-16 15:04:59 +08:00
+// Last Modified At: 2026-11-16 15:09:14 +08:00
 #pragma once
 #include <windows.h>
 
@@ -53,6 +53,11 @@ static constexpr const wchar_t* kRegClasses = L"TaskbarSplitClasses";   //REG_SZ
 //   父容器自己在任务栏里偏右多少它不说，早先整组看着"永远偏半颗按钮"就差这 22.8 DIP。
 //   现在整组左沿改用 UIA 边界（屏幕口径）当场校准：off 应当是个稳定的小数（几十 DIP 内），cal 跟着趟数涨；
 //   cal=0 或 off=0 = peer 一直量不到这颗按钮，居中退回老口径，症状就是"差半颗按钮"，不会更坏。
+//   【11-16 下午：判据认了岛内坐标以后这一条才真的开工】同一排按钮隔几分钟两次现场，
+//   peer 那颗的 bd 分别是 630(=504 DIP) 和 603(=482 DIP)，而 left/width/d 一模一样 ——
+//   差半颗按钮是"这一趟第一个来排版的不是最左那颗"（ph= 从 9 涨到 40），不是容器真挪了。
+//   所以校准加了限速：每趟最多挪一颗按钮宽（44 DIP），第一趟从 0 走到 -22 在限内，往后只有真变了才动。
+//   看现场：off 应当收敛到一个稳定值（这台机器预计 -22 左右），cal 跟着涨；整组屏幕左沿 = left + d 应当正好是 (panel-width)/2 = 504。
 //自洽检查（不用看屏幕）：left + d + width/2 应当等于 panel/2；对不上就是 off 没吃到。
 //axis 一变（任务栏拖到侧边）上一趟的记账当场作废、这一趟不挪，所以那一趟看到 d=0 是正常的，不是算错。
 //为什么单独一行不塞进 TaskbarSplitEdges：Edges 已经被四格 + 小组件判据占满，而"居中没居中"是一眼就能看出来的毛病，值得一行专门的答案。
