@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-13 15:22:58 +08:00
+// Last Modified At: 2026-11-16 12:23:45 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -141,7 +141,17 @@ static constexpr int kWidgetsAncestorWalk = 12;
 static std::atomic<double> g_widgets_shift_dip{ 0.0 };       //现在生效的平移（负数=往左钉）
 static std::atomic<double> g_widgets_pin_right_dip{ 0.0 };   //钉好以后天气内容（图标+温度文字）的右沿，TM 跟在这个数后面；0=这一轮没钉
 static std::atomic<double> g_widgets_btn_left_dip{ 0.0 };    //诊断：按钮自己的可见左沿，已减掉平移=系统原来排的那份
-static std::atomic<double> g_widgets_btn_width_dip{ 0.0 };   //诊断：按钮自己的可见宽（含右边那段没画东西的热区）
+static std::atomic<double> g_widgets_btn_width_dip{ 0.0 };   //诊断：钉之前内容的可见宽（图标+温度文字）
+//为什么要把"没钉的原因"折成一个数：ws=0 这一种样子背后是三个完全不同的病（眼神没量到 / 左侧块还没量到 /
+//中间那条缝真不够宽），该改哪一处只有现场能回答；11-16 那次就是靠 ws=0 加 src=rect 才锁定到"整屏边界"，
+//中间绕了一轮猜测。现在一个数直接说完，不用再看第二行推。
+//0=钉成了 1=这一格没量到屏幕边界（退回排版矩形）2=左侧三格没量到 3=中间那条缝比"让位+内容宽"还窄
+static std::atomic<int> g_widgets_pin_refuse{ 0 };
+//钉过去给多任务视图让出来的安全位（DIP）。
+//为什么要有这个数：小组件的可点区域比它画出来的内容宽（现场 ActualWidth 152 DIP），
+//而天气图标在按钮里面还进去约 14 DIP（实测 18px @125%）——照块宽右沿齐平钉，
+//按钮左沿就会压住多任务视图右边那一窄条，点多任务变成开小组件。16 = 14 + 2 余量。
+static constexpr double kWidgetsIconSafetyDip = 16.0;
 static thread_local bool g_in_hook{ false };
 
 //【片4 · 先认名字，再谈居中】把"不是那四个系统按钮"的控件类型名报出来。
@@ -487,25 +497,60 @@ static bool TrayFrame(RECT* out_rc, UINT* out_dpi)
     return true;
 }
 
-//把一段物理像素边界并进 span（相对任务栏左沿、按窗口 DPI 折算成 DIP）。
-//宽或高为 0 = 这块现在看不见，不收。
-static bool UnionBoundsIntoSpan(Rect const& bounds, RECT const& tray_rc, UINT dpi, VisibleSpan* io)
+//一段 peer 边界能不能算"任务栏带子里的一块"：0=能收，其余是卡在哪儿（1=宽高为 0 2=坐标离谱
+//3=中心点不在带子里 4=比带子高或比窗口宽 5=单块占掉三分之一条任务栏）。
+//为什么单独折出来：钉位、校准、块宽全都卡在这几句判据上，一旦"屏幕口径为什么一直失灵"就必须说清
+//是 peer 没给数、抛异常、还是给了却被哪一道拒了 —— 判据本身只许写这一处，探测和量取共用它。
+static int BoundsRejectReason(Rect const& bounds, RECT const& tray_rc, UINT dpi,
+    double* out_left, double* out_right)
 {
     if (!std::isfinite(bounds.Width) || !std::isfinite(bounds.Height) ||
         bounds.Width <= 0.0 || bounds.Height <= 0.0)
-        return false;
+        return 1;
 
     const double scale = 96.0 / dpi;
     const double left = (static_cast<double>(bounds.X) - tray_rc.left) * scale;
     const double right = (static_cast<double>(bounds.X) + bounds.Width - tray_rc.left) * scale;
     //任务栏再宽也不会到十万 DIP，越界说明这个版本的 peer 给的坐标不是这个意思
     if (!std::isfinite(left) || !std::isfinite(right) || right <= 0.0 || right > 100000.0)
-        return false;
+        return 2;
     //只算"竖着落在任务栏那一条里"的：往下并孩子的时候，模板里可能挂着开始菜单/搜索面板那种
     //整屏大的内容宿主（它也在视觉树上，但它是弹出来的岛），并进来的话这一格会一口气报出半屏宽，
     //TM 直接被顶到屏幕中间去。判据就用最直白的：这块的中心点得在任务栏那条带子里。
     const double mid_y = static_cast<double>(bounds.Y) + bounds.Height / 2.0;
     if (mid_y < static_cast<double>(tray_rc.top) || mid_y >= static_cast<double>(tray_rc.bottom))
+        return 3;
+    //再加两道硬边：比任务栏窗口本身还高或还宽的，一定不是这条带子里的一块（内容岛就是整屏）。
+    //这两条拦不到任何按钮：按钮比带子矮、比窗口窄。
+    const double tray_band = static_cast<double>(tray_rc.bottom) - static_cast<double>(tray_rc.top);
+    const double tray_span = static_cast<double>(tray_rc.right) - static_cast<double>(tray_rc.left);
+    if (static_cast<double>(bounds.Height) > tray_band || static_cast<double>(bounds.Width) > tray_span)
+        return 4;
+    //第三道：单块占掉三分之一条任务栏还多的也不是按钮。最宽的搜索框（切成图标和标签那一档）
+    //也就 224 DIP 上下，1920@125% 下三分之一条任务栏是 512 DIP，拦不到任何一格。
+    if (right - left > (tray_span * scale) / 3.0)
+        return 5;
+
+    if (out_left != nullptr)
+        *out_left = left;
+    if (out_right != nullptr)
+        *out_right = right;
+    return 0;
+}
+
+//把一段物理像素边界并进 span（相对任务栏左沿、按窗口 DPI 折算成 DIP）。
+//宽或高为 0 = 这块现在看不见，不收。
+//【11-16 现场】src= 永远 rect、cal= 永远 0、ws= 永远 0 —— 一句判据都没放行过。
+//小组件那颗按钮的 peer 报的是一整块屏幕（X=0、Y=0、宽约 1920、高约 1080 这种），中心点 y=540
+//落在带子外面，第 3 道就把整屏岛拒了：拒得对，但它把"屏幕那把尺子"一起废了 ——
+//这一格再也没有可用边界，VisibleSpanDip 只能退回排版矩形，钉位和校准全都开不了工。
+//所以这次除了判据，还把 peer 报回的原始数写进 TaskbarSplitPeerEvidence（bd=）：
+//到底是"坐标口径不对（Y 是个位数）"还是"真的报了整屏"，下一次现场一行就能看出来，别再靠猜。
+static bool UnionBoundsIntoSpan(Rect const& bounds, RECT const& tray_rc, UINT dpi, VisibleSpan* io)
+{
+    double left = 0.0;
+    double right = 0.0;
+    if (BoundsRejectReason(bounds, tray_rc, dpi, &left, &right) != 0)
         return false;
 
     if (!io->ok)
@@ -722,6 +767,137 @@ static VisibleSpan VisibleSpanDip(FrameworkElement const& element, double fallba
     return span;
 }
 
+//【这一轮真正要的东西：眼睛为什么失灵，用一行注册表回答】
+//11-16 现场：src= 永远 rect、cal= 永远 0、ws= 永远 0、w=117500 —— 屏幕那把尺子一次都没生效，
+//但"没生效"有三种完全不同的病：peer 压根没建起来 / GetBoundingRectangle 抛了 / 报了个数却被判据拒了，
+//而拒又是哪一道拒的（中心点不在带子里？比窗口宽？）。上一轮我就是靠猜判据改了两版，全是白编译。
+//所以这里一次抄四个证据：peer 报的物理像素边界、任务栏窗口自己的矩形、异常码、判据拒在第几道，
+//再加 XAML 自己那套坐标（TransformToVisual 到视觉树根）——
+//两套口径一起摆出来，"坐标到底是不是屏幕的"这一句当场有答案。
+struct PeerEvidence
+{
+    int peer_created = 0;     //CreatePeerForElement 有没有给对象
+    int frame_ok = 0;         //任务栏窗口矩形拿到了没有
+    int bounds_seen = 0;      //GetBoundingRectangle 有没有返回
+    int reject = -1;          //BoundsRejectReason 的结果：-1=没问 0=放行 1..5=卡在哪一道
+    long bx = 0, by = 0, bw = 0, bh = 0;    //peer 原始边界（物理像素，原样抄，不折算）
+    long tl = 0, tt = 0, tr_ = 0, tb = 0;   //Shell_TrayWnd 的窗口矩形（物理像素）
+    int dpi = 96;
+    long hr = 0;              //抛出来的 hresult（0=没抛）
+    int tf_ok = 0;            //TransformToVisual(根) 走通了没有
+    long fx = 0, fy = 0, fw = 0, fh = 0;    //元素在"根那一层"的位置和大小（DIP）
+    int depth = 0;            //往上走了几层才到根（顺便说明这棵树有多深）
+};
+static PeerEvidence g_peer_widgets;
+static PeerEvidence g_peer_app;
+
+//取一份证据。只在两个地方调用：小组件那一格钉之前、应用组新一趟的第一个按钮 ——
+//都是每趟一次的热路径边缘，量一次多两三个 XAML 调用，换一行能看懂的现场值得。
+static void CollectPeerEvidence(FrameworkElement const& element, PeerEvidence* out)
+{
+    *out = PeerEvidence{};
+
+    RECT tray_rc{};
+    UINT dpi = 96;
+    out->frame_ok = TrayFrame(&tray_rc, &dpi) ? 1 : 0;
+    out->dpi = static_cast<int>(dpi);
+    out->tl = tray_rc.left;
+    out->tt = tray_rc.top;
+    out->tr_ = tray_rc.right;
+    out->tb = tray_rc.bottom;
+
+    try
+    {
+        auto peer = xaml_peers::FrameworkElementAutomationPeer::CreatePeerForElement(element);
+        out->peer_created = peer ? 1 : 0;
+        if (peer && out->frame_ok != 0)
+        {
+            const Rect b = peer.GetBoundingRectangle();
+            out->bounds_seen = 1;
+            out->bx = static_cast<long>(std::lround(b.X));
+            out->by = static_cast<long>(std::lround(b.Y));
+            out->bw = static_cast<long>(std::lround(b.Width));
+            out->bh = static_cast<long>(std::lround(b.Height));
+            out->reject = BoundsRejectReason(b, tray_rc, dpi, nullptr, nullptr);
+        }
+    }
+    catch (hresult_error const& e)
+    {
+        out->hr = static_cast<long>(static_cast<unsigned int>(e.code()));
+    }
+    catch (...)
+    {
+        out->hr = -1;
+    }
+
+    //第二套口径：XAML 自己认为这个元素在根的哪儿。这条完全不碰 UIA，
+    //如果它给出的 y 是个位数、而 peer 给出的 y 是一千多，两套坐标差的就是"窗口原点"，
+    //屏幕那把尺子要怎么折算当场就有答案（应用图标那 22.8 DIP 就是这类差值）。
+    try
+    {
+        FrameworkElement root = element;
+        for (int i = 0; i < 40; i++)
+        {
+            auto parent = xaml_media::VisualTreeHelper::GetParent(root);
+            auto up = parent.try_as<FrameworkElement>();
+            if (!up)
+                break;
+            root = up;
+            out->depth = i + 1;
+        }
+        const auto transform = element.TransformToVisual(root);
+        const Point origin{ 0.0f, 0.0f };
+        const Point p = transform.TransformPoint(origin);
+        out->tf_ok = 1;
+        out->fx = static_cast<long>(std::lround(p.X));
+        out->fy = static_cast<long>(std::lround(p.Y));
+        out->fw = static_cast<long>(std::lround(element.ActualWidth()));
+        out->fh = static_cast<long>(std::lround(element.ActualHeight()));
+    }
+    catch (hresult_error const& e)
+    {
+        if (out->hr == 0)
+            out->hr = static_cast<long>(static_cast<unsigned int>(e.code()));
+    }
+    catch (...)
+    {
+        if (out->hr == 0)
+            out->hr = -2;
+    }
+}
+
+//两份证据拼一行写进注册表。为什么敢每趟都调：串没变就直接返回，
+//只有现场真的换了才开一次键（小组件那一格和应用组各一列，一眼看完）。
+static void PublishPeerEvidence()
+{
+    wchar_t buf[512]{};
+    ::swprintf_s(buf,
+        L"W pk=%d tfok=%d bs=%d rj=%d bd=%d,%d,%d,%d tr=%d,%d,%d,%d dpi=%d hr=%x xywh=%d,%d,%d,%d dp=%d"
+        L" | A pk=%d tfok=%d bs=%d rj=%d bd=%d,%d,%d,%d tr=%d,%d,%d,%d dpi=%d hr=%x xywh=%d,%d,%d,%d dp=%d",
+        g_peer_widgets.peer_created, g_peer_widgets.tf_ok, g_peer_widgets.bounds_seen, g_peer_widgets.reject,
+        static_cast<int>(g_peer_widgets.bx), static_cast<int>(g_peer_widgets.by),
+        static_cast<int>(g_peer_widgets.bw), static_cast<int>(g_peer_widgets.bh),
+        static_cast<int>(g_peer_widgets.tl), static_cast<int>(g_peer_widgets.tt),
+        static_cast<int>(g_peer_widgets.tr_), static_cast<int>(g_peer_widgets.tb),
+        g_peer_widgets.dpi, static_cast<unsigned>(g_peer_widgets.hr),
+        static_cast<int>(g_peer_widgets.fx), static_cast<int>(g_peer_widgets.fy),
+        static_cast<int>(g_peer_widgets.fw), static_cast<int>(g_peer_widgets.fh), g_peer_widgets.depth,
+        g_peer_app.peer_created, g_peer_app.tf_ok, g_peer_app.bounds_seen, g_peer_app.reject,
+        static_cast<int>(g_peer_app.bx), static_cast<int>(g_peer_app.by),
+        static_cast<int>(g_peer_app.bw), static_cast<int>(g_peer_app.bh),
+        static_cast<int>(g_peer_app.tl), static_cast<int>(g_peer_app.tt),
+        static_cast<int>(g_peer_app.tr_), static_cast<int>(g_peer_app.tb),
+        g_peer_app.dpi, static_cast<unsigned>(g_peer_app.hr),
+        static_cast<int>(g_peer_app.fx), static_cast<int>(g_peer_app.fy),
+        static_cast<int>(g_peer_app.fw), static_cast<int>(g_peer_app.fh), g_peer_app.depth);
+
+    static std::wstring last_published;
+    if (last_published == buf)
+        return;
+    last_published = buf;
+    SplitRegWriteStringIfChanged(kRegPeerEvidence, buf);
+}
+
 //【片4】记下一个"不是那四个系统按钮"的控件类型名，第一次见到就报一行。
 //返回 true 只在"这一趟第一次见到这个名字"时成立：名字集合一旦稳定，这一行就不再重写，
 //省得把每帧排版变成一次跨进程写盘（注册表写一次就会叫醒一次监视它的插件，那是白烧 CPU）。
@@ -853,41 +1029,28 @@ static double g_app_group_offset_dip{ 0.0 };   //排版矩形的 X 到屏幕左�
 static long g_app_group_calib{ 0 };            //这个平移量成功量到几次（0 = peer 一直不认，整组只能按老口径居中）
 
 //最左那颗应用按钮在屏幕上的真实左沿（DIP，相对任务栏左沿）。
-//为什么非要用 peer 量这一次：交给挂钩的 rect.X 是排版矩形的坐标，也就是"父容器那一层"的坐标，
+//为什么非要用屏幕口径量这一次：交给挂钩的 rect.X 是排版矩形的坐标，也就是"父容器那一层"的坐标，
 //父容器（现场确认是 ItemsRepeater）自己在任务栏里偏右多少，排版矩形里一个字都没有。
 //现场（1920@125%，注册表 + 截图各量一遍）：left=14320、d=36080 按公式应当落在 504 DIP，
 //屏幕上亮核量到 526.8 DIP —— 差 22.8 DIP，正好半颗按钮，就是你看到的"图标不居中"。
-//折半的公式没错，错的是拿排版坐标当屏幕坐标用。peer 给的是物理像素的可见边界，和截图一个口径，
-//左边三格早就用它了，这里沿用同一把尺子。
+//折半的公式没错，错的是拿排版坐标当屏幕坐标用。
+//这把尺子和左边三格共用同一个函数（VisibleSpanDip）：它按 UIA 边界取，取不到或量出来不像一块按钮
+//就往下并孩子一层，并且已经被 11-16 那三道硬边（比带子高、比任务栏窗口宽、单块占掉三分之一条任务栏）挡住整屏内容岛。
+//不直接用 peer.GetBoundingRectangle()：按钮自己那层很可能报的是模板里挂着的整屏内容宿主（11-16 现场：
+//小组件那颗报的就是 0~1080），那种数并不出可用范围，只会让 src= 永远 rect、cal= 永远 0。
 //只在"新一趟的第一个按钮"上量一次（一趟一次），Arrange 是每帧每个按钮都要过的热路径，不能每颗都问。
-static bool MeasureAppLeftEdgeDip(FrameworkElement const& element, RECT const& tray_rc, UINT dpi,
-    double* out_left_dip)
+static bool MeasureAppLeftEdgeDip(FrameworkElement const& element, double* out_left_dip)
 {
-    try
-    {
-        auto peer = xaml_peers::FrameworkElementAutomationPeer::CreatePeerForElement(element);
-        if (!peer)
-            return false;
-        const Rect bounds = peer.GetBoundingRectangle();
-        if (!std::isfinite(bounds.Width) || !std::isfinite(bounds.Height) ||
-            bounds.Width <= 0.0 || bounds.Height <= 0.0)
-            return false;
-        //和 UnionBoundsIntoSpan 同一道判据：中心点必须落在任务栏那条带子里，
-        //不然量到的是模板里挂着的整屏内容岛，那个数拿来居中能把整组甩出屏幕。
-        const double mid_y = static_cast<double>(bounds.Y) + bounds.Height / 2.0;
-        if (mid_y < static_cast<double>(tray_rc.top) || mid_y >= static_cast<double>(tray_rc.bottom))
-            return false;
-        const double scale = 96.0 / dpi;
-        const double left = (static_cast<double>(bounds.X) - tray_rc.left) * scale;
-        if (!std::isfinite(left) || left < 0.0 || left > 100000.0)
-            return false;
-        *out_left_dip = left;
-        return true;
-    }
-    catch (...)
-    {
+    //一趟一次，顺手把这颗按钮的屏幕口径证据抄一份（为什么在这：这是整组居中唯一需要屏幕数的地方）。
+    CollectPeerEvidence(element, &g_peer_app);
+    PublishPeerEvidence();
+
+    bool visible = true;
+    const VisibleSpan span = VisibleSpanDip(element, 0.0, &visible);
+    if (!span.ok || !span.from_uia || !visible || span.width <= 0.0)
         return false;
-    }
+    *out_left_dip = span.left;
+    return true;
 }
 
 static bool IsAppIconButton(std::wstring const& class_name)
@@ -1034,7 +1197,7 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
             //缓存反而会把这个错帧锁死，所以宁可抖一帧。
             double offset = 0.0;
             double peer_left = 0.0;
-            if (MeasureAppLeftEdgeDip(element, tray_rc, tray_dpi, &peer_left))
+            if (MeasureAppLeftEdgeDip(element, &peer_left))
             {
                 g_app_group_calib++;
                 const double candidate = peer_left - g_app_sweep_min_dip - g_app_group_delta_dip;
@@ -1129,6 +1292,7 @@ static void ResetAppGroupAccounting()
     g_widgets_pin_right_dip = 0.0;
     g_widgets_btn_left_dip = 0.0;
     g_widgets_btn_width_dip = 0.0;
+    g_widgets_pin_refuse = 0;
 }
 
 //四个按钮各自报上来的右边沿，一行写清楚。为什么要这一行：块宽只有一个数，
@@ -1152,13 +1316,20 @@ static void ResetAppGroupAccounting()
 //小组件那一格（dw 最后一位）量的是天气图标+温度文字，不含按钮右边那段没画东西的热区。
 //ws=/wp=/wl=/wb= 是"把小组件钉进左侧块"那一刀的现场（都是 1/100 DIP）：
 //ws= 现在生效的平移（负数=往左钉，0=这一轮没钉）；wp= 钉好以后 TM 跟的那个右沿，wp=0 就是没钉、TM 还是跟左侧三格；
-//wl= 按钮自己的可见左沿（已减掉平移，就是系统原来排的那份，右侧时应当是个大数）；wb= 按钮自己的可见宽。
-//怎么读：ws=0 且 wl 很大 = 缝不够宽（应用图标那排太靠左）或者 peer 没量到，故意不钉，去看 room 那两个数；
-//ws 正常但屏幕上小组件还在右边 = 平移没落到元素上；wp 比 tv 只大一点点 = 钉对了、TM 紧跟在天气文字后面。
+//wl= 钉的那块内容的可见左沿（已减掉平移，就是系统原来排的那份，右侧时应当是个大数）；
+//wb= 钉的那块内容的可见宽（量得到叶子就是天气图标+温度文字，量不到才是整颗按钮）。
+//wr= 为什么没钉（0=钉成了 1=这一格没量到屏幕边界 2=左侧三格没量到 3=中间那条缝比"让位+内容宽"还窄）：
+//    ws=0 这一种样子背后是三个完全不同的病，11-16 那次就是靠"ws=0 + src=rect"才反推出来的，
+//    中间白白绕了一轮猜测——现在一个数直接说清楚，不用再推。
+//怎么读：wr=1 且 src=rect = 屏幕那把尺子又失灵了（多半是某层 peer 报了整屏边界，回去看 UnionBoundsIntoSpan）；
+//wr=3 = 应用图标那排太靠左，缝真不够，故意不钉；ws 正常但屏幕上小组件还在右边 = 平移没落到元素上；
+//wp 比 tv 只大一点点 = 钉对了、TM 紧跟在天气文字后面。
 static void PublishEdges()
 {
-    wchar_t edges[320]{};
-    ::swprintf_s(edges, L"s=%d se=%d tv=%d w=%d src=%s n=%d/%d/%d/%d ev=%d vis=%d aw=%d why=%d pv=%d pw=%d ld=%d ms=%d dw=%d/%d/%d/%d ws=%d wp=%d wl=%d wb=%d",
+    //512：这一行字段一直在加（四格 + 事件 + 判据 + dw 四档 + 钉位四个 + wr），
+    //按每个数都取满六位估就已经接近 320，而 swprintf_s 拿到数组走的是模板重载，写不下直接终止进程。
+    wchar_t edges[512]{};
+    ::swprintf_s(edges, L"s=%d se=%d tv=%d w=%d src=%s n=%d/%d/%d/%d ev=%d vis=%d aw=%d why=%d pv=%d pw=%d ld=%d ms=%d dw=%d/%d/%d/%d ws=%d wp=%d wl=%d wb=%d wr=%d",
         static_cast<int>(std::lround(g_button_right_edge_dip[0].load() * 100.0)),
         static_cast<int>(std::lround(g_button_right_edge_dip[1].load() * 100.0)),
         static_cast<int>(std::lround(g_button_right_edge_dip[2].load() * 100.0)),
@@ -1183,7 +1354,8 @@ static void PublishEdges()
         static_cast<int>(std::lround(g_widgets_shift_dip.load() * 100.0)),
         static_cast<int>(std::lround(g_widgets_pin_right_dip.load() * 100.0)),
         static_cast<int>(std::lround(g_widgets_btn_left_dip.load() * 100.0)),
-        static_cast<int>(std::lround(g_widgets_btn_width_dip.load() * 100.0)));
+        static_cast<int>(std::lround(g_widgets_btn_width_dip.load() * 100.0)),
+        g_widgets_pin_refuse.load());
     SplitRegWriteStringIfChanged(kRegEdges, edges);
 }
 
@@ -1330,67 +1502,119 @@ static void ClearBlockEnd(SystemButton button)
     PublishBlockFromSlots();
 }
 
-//把小组件整颗按钮往左钉，钉到"开始/搜索/多任务"那一块的右沿上；钉好了把转发矩形改好交出去，钉不了就原样交回。
+//把小组件往左钉，钉到"开始/搜索/多任务"那一块的右沿后面；钉好了把转发矩形改好交出去，钉不了就原样交回。
 //三个要点，每条都对应一个已经踩过的坑：
 //1) 平移量按屏幕口径算（UIA 边界），不按排版矩形。这颗按钮挂在右侧托盘那一层，
 //   它 rect.X 到屏幕之间隔着父容器的偏移（应用图标那组刚为这 22.8 DIP 踩过一次），
 //   拿 rect.X 折算就是另一套坐标里折中，永远差一截。
 //2) 算下一刀之前必须先把"现在生效的那一刀"减掉：peer 量到的是上一帧的结果，里面已经含着我们加的平移，
 //   直接 目标 - 量到的 就是反馈回路（一帧左一帧右摆）；减掉以后拿到的才是系统原来排的那份，一次就到位。
-//3) 下刀贴着按钮自己的可见左沿，不贴天气图标的左沿：图标在按钮里面还进去一小截（现场约 14 DIP），
-//   照图标对齐会把多任务视图右边那一窄条点区盖住——点多任务变成开小组件。
-//   TM 跟的是"内容右沿"（图标+温度文字）：按钮右边那段空白热区压在 TM 窗口底下不碍事，
-//   TM 是真窗口，自己收点击，比在小组件和 TM 之间空出 60 多 DIP 好看。
-//放不下就不钉：中间那条缝（左侧块右沿到已经居中的那排图标左沿）比按钮本身窄，
+//3) 钉的是"天气内容"（图标+温度文字）的左沿，落点是块宽右沿再让出 kWidgetsIconSafetyDip：
+//   这颗按钮的可点区域比它画出来的内容宽（现场 ActualWidth 152 DIP，内容只占其中几十），
+//   内容在按钮里面还进去约 14 DIP（实测 18px@125%），照块宽右沿齐平钉就会把多任务视图右边那一窄条点区盖住
+//   ——点多任务变成开小组件。让出 16 DIP 就正好把这 14 DIP 兜住，还留 2 DIP 余量。
+//   TM 跟的也是内容右沿（不是整颗按钮右沿）：按钮右边那段空白热区压在 TM 窗口底下不碍事，
+//   TM 是真窗口自己收点击，比在小组件和 TM 之间空出 60 多 DIP 好看。
+//放不下就不钉：中间那条缝（左侧块右沿到已经居中的那排图标左沿）比"让位+内容宽"还窄，
 //宁可按系统排的样子留在右边，也别和图标叠在一起。
 static void PinWidgetsLeft(FrameworkElement const& element, Rect const rect, Rect* io)
 {
     g_widgets_pin_right_dip = 0.0;
+    g_widgets_pin_refuse = 0;
 
     bool visible = true;
-    const VisibleSpan btn = VisibleSpanDip(element,
+    //先把这颗按钮的屏幕口径证据抄一份：钉不成时（wr=1）到底卡在 peer 没建起来、抛异常还是被判据第几道拒了，
+    //全在 TaskbarSplitPeerEvidence 那一行的 W 段里，不用再来一轮猜测加编译。
+    CollectPeerEvidence(element, &g_peer_widgets);
+    PublishPeerEvidence();
+
+    //按钮自己那一层在带子里量到的块。整屏大的内容岛已经被 UnionBoundsIntoSpan 那三道硬边挡掉
+    //（11-16 现场就是它把屏幕口径全灭的：src=rect、cal=0、ws=0）。
+    const VisibleSpan measured = VisibleSpanDip(element,
         static_cast<double>(rect.X) + rect.Width, &visible);
-    //必须是 peer 量出来的数才能钉：退回排版矩形时 left/width 全是 0，那是另一套坐标，算出来的刀能飞出去。
-    if (!btn.ok || !btn.from_uia || !visible || btn.width <= 0.0)
+    const bool measured_ok = measured.ok && measured.from_uia && visible && measured.width > 0.0;
+
+    //先问一句"这一格还占位吗"：小组件在设置里关掉时 VisibleSpanDip 明确交回 visible=false，
+    //这时叶子那一格可能还挂着上一轮的旧数，照旧数钉就等于把空气挪进左侧块。
+    if (!visible)
     {
         g_widgets_shift_dip = 0.0;
+        g_widgets_pin_refuse = 4;
+        PublishBlockFromSlots();
         return;
     }
 
-    const double unshifted_left = btn.left - g_widgets_shift_dip.load();
-    g_widgets_btn_left_dip = unshifted_left;
-    g_widgets_btn_width_dip = btn.width;
+    //钉哪一块：优先叶子（天气图标+温度文字），它由 RepublishWidgetsEdge 在同一帧里刚算好，
+    //比"按钮这一层"更贴眼睛看到的内容，而且右边那段空白热区不该算进块宽。
+    //为什么把叶子放在第一顺位而不是"量不到才用"：11-16 之后按钮那层的整屏边界被硬边拒收，
+    //那一层很可能一个数都不剩——这时叶子是唯一还活着的屏幕口径，顺序反过来就等于永远钉不成。
+    //RecordButtonSpan 只在 from_uia 且宽>0 时才留数，所以 leaf_width>0 本身就是"这数是 UIA 量出来的"。
+    const int w_index = static_cast<int>(SystemButton::Widgets);
+    const double leaf_left = g_button_visible_left_dip[w_index].load();
+    const double leaf_width = g_button_visible_width_dip[w_index].load();
+    double anchor_left = 0.0;
+    double anchor_width = 0.0;
+    if (leaf_width > 0.0)
+    {
+        anchor_left = leaf_left;
+        anchor_width = leaf_width;
+        //两层都量到了却对不上（叶子不在按钮那块里面）= 其中一层拿错了元素，退回按钮那层，
+        //别拿一份不知道是谁的坐标去下刀。
+        if (measured_ok && (leaf_left < measured.left - 1.0 ||
+            leaf_left + leaf_width > measured.right + 1.0))
+        {
+            anchor_left = measured.left;
+            anchor_width = measured.width;
+        }
+    }
+    else if (measured_ok)
+    {
+        anchor_left = measured.left;
+        anchor_width = measured.width;
+    }
+    //必须是屏幕口径的数才能钉：排版矩形和屏幕之间隔着父容器的平移，拿它折中就是往另一套坐标里挪人。
+    if (anchor_width <= 0.0 || !std::isfinite(anchor_left))
+    {
+        g_widgets_shift_dip = 0.0;
+        g_widgets_pin_refuse = 1;
+        PublishBlockFromSlots();    //wp 刚被清成 0，让块宽跟着缩回去，别挂着上一帧的钉位
+        return;
+    }
+
+    const double unshifted_left = anchor_left - g_widgets_shift_dip.load();
+    g_widgets_btn_left_dip = unshifted_left;     //诊断：钉之前，内容在屏幕上的左沿（没钉时是个大数=它还在右边）
+    g_widgets_btn_width_dip = anchor_width;
 
     const double block_end = LeftClusterEnd();
     if (!std::isfinite(block_end) || block_end <= 0.0)
     {
         g_widgets_shift_dip = 0.0;
+        g_widgets_pin_refuse = 2;
+        PublishBlockFromSlots();
         return;     //左侧三格还没量到：连钉到哪儿都不知道，不动
     }
 
+    const double target = block_end + kWidgetsIconSafetyDip;
+
     //中间那条缝有多宽：应用组的屏幕左沿 = 校准后的整组左沿 + 这一趟生效的偏移（两个都是屏幕口径）。
-    //这一格还没量过（应用一个没开）时缝就是整条任务栏，照样钉得进去。
+    //应用一个都没开（整组从没量过）时不卡这一条：那时从左块右沿到托盘之间整段都是空的，
+    //照样钉得进去；量到了却落在块里或以内才是真挤，那种情况宁可留在右边也别和图标叠。
     const double app_left = g_app_group_left_dip + g_app_group_delta_dip;
-    const double room = (app_left > block_end && std::isfinite(app_left)) ? (app_left - block_end) : 0.0;
-    if (btn.width > room)
+    const bool app_measured = g_app_group_count > 0 && std::isfinite(app_left);
+    const bool fits = !app_measured ||
+        (kWidgetsIconSafetyDip + anchor_width <= app_left - block_end);
+    if (!fits)
     {
         g_widgets_shift_dip = 0.0;
+        g_widgets_pin_refuse = 3;
+        PublishBlockFromSlots();
         return;
     }
 
-    const double delta = block_end - unshifted_left;
+    const double delta = target - unshifted_left;
     g_widgets_shift_dip = delta;
     io->X = static_cast<float>(static_cast<double>(io->X) + delta);
-
-    //TM 跟的右沿：内容在按钮里进去多少、内容本身多宽，这两个差值平移前后都一样，
-    //所以拿现场那两个数当场相减就行，不用再去猜"钉好以后会在哪儿"。
-    const int w_index = static_cast<int>(SystemButton::Widgets);
-    const double content_left = g_button_visible_left_dip[w_index].load();
-    const double content_width = g_button_visible_width_dip[w_index].load();
-    if (content_width > 0.0 && content_left >= btn.left - 1.0)
-        g_widgets_pin_right_dip = block_end + (content_left + content_width - btn.left);
-    else
-        g_widgets_pin_right_dip = block_end + btn.width;    //叶子量不到（模板换了/折叠中）就按整颗按钮宽算，宁可空一点也别压住
+    g_widgets_pin_right_dip = target + anchor_width;    //TM 就钉在内容右沿后面，一点不空
     PublishBlockFromSlots();
 }
 
@@ -1838,6 +2062,7 @@ static HRESULT WINAPI ArrangeHook(void* p_this, Rect rect)
                 g_widgets_pin_right_dip = 0.0;
                 g_widgets_btn_left_dip = 0.0;
                 g_widgets_btn_width_dip = 0.0;
+                g_widgets_pin_refuse = 0;
             }
             return g_arrange_original(p_this, rect);
         }

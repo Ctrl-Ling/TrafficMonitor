@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-13 15:22:58 +08:00
+// Last Modified At: 2026-11-16 12:23:45 +08:00
 #pragma once
 #include <windows.h>
 
@@ -66,10 +66,23 @@ static constexpr const wchar_t* kRegEdges = L"TaskbarSplitEdges";       //REG_SZ
                                                                         //这一行是"开关小组件后 TM 贴不贴得回去"的唯一现场：ev 不涨=压根没被叫醒（现在还有另一条节拍：左侧三个按钮每次排版都会复核小组件那一格，见 TaskbarSplit.cpp 的 RefreshWidgetsSlotFromSiblings）；w 不降且 why=0=眼神还不够，看 ld/vis/pv/pw 哪个不对再加判据。
                                                                         //块宽只有一个数，"某个按钮没报上来"和"某个按钮报大了"看着一样，靠这四格一次分清；开关小组件后这一行动不动，分的又是"事件没来"和"来了没量到"。
 //ws=/wp=/wl=/wb= 是"把小组件钉进左侧块"那一刀的现场(1/100 DIP)：ws=现在生效的平移（负数=往左钉，0=这一轮没钉），
-//wp=钉好以后 TM 跟的那个右沿（wp=0 表示没钉，块宽还是左侧三格那条线），wl=按钮自己的可见左沿（已减掉平移=系统原来排的那份，
-//没钉的时候它是个大数，就是它在右侧托盘前面），wb=按钮自己的可见宽（含右边那段空白热区）。
-//读法：wl 大、ws=0 = 缝不够宽（应用图标那排太靠左）或 peer 没量到，故意不钉；ws 正常而屏幕上小组件还在右边 = 平移没落到元素上；
+//wp=钉好以后 TM 跟的那个右沿（wp=0 表示没钉，块宽还是左侧三格那条线），wl=钉的那块内容的左沿（已减掉平移=系统原来排的那份，
+//没钉的时候它是个大数，就是它在右侧托盘前面），wb=钉的那块内容的宽（量得到叶子就是天气图标+温度文字，量不到才是整颗按钮）。
+//wr=为什么没钉（0=钉成了 1=这一格没量到屏幕口径的边界 2=左侧三格还没量到 3=中间那条缝比"让位 16 DIP+内容宽"还窄 4=这一格现在不占位）：
+//ws=0 这一种样子背后是四个完全不同的病，11-16 那轮就是靠"ws=0 + src=rect"反推了半天，一个数直接说清楚。
+//读法：wr=1 就去看 TaskbarSplitPeerEvidence 的 W 段（peer 没建起来？抛了？被第几道判据拒了？）；wr=3 = 应用图标那排太靠左，故意不钉；
+//ws 正常而屏幕上小组件还在右边 = 平移没落到元素上（刀算对了、没写进转发矩形）；
 //wp 比 tv 只大几十 DIP = 钉对了，TM 紧跟在天气文字后面。
+//【屏幕那把尺子为什么失灵，这一行直接给原样证据】W 段=小组件那颗按钮，A 段=新一趟最左那颗应用图标；
+//每段 pk=CreatePeerForElement 有没有给对象，tfok=XAML 自己那套坐标走通了没有，bs=GetBoundingRectangle 有没有返回，
+//rj=BoundsRejectReason 拒在第几道（-1 没问 0 放行 1 宽高为0 2 坐标离谱 3 中心点不在任务栏带子里 4 比带子高或比窗口宽 5 单块占掉三分之一条任务栏），
+//bd=peer 报的原始边界（物理像素，原样抄、不折算），tr=Shell_TrayWnd 的窗口矩形（物理像素），dpi=窗口 DPI，hr=抛出来的 hresult（十六进制，0=没抛），
+//xywh=TransformToVisual(视觉树根) 得到的位置和元素自己的 ActualWidth/Height（DIP），dp=往上走到根经过了几层。
+//怎么用：bd 的 y 是一千多（和 tr 的 top 同量级）= peer 报的就是屏幕坐标，那就是被 rj 拒了，改判据；
+//bd 的 y 是个位数而 xywh 的 y 也是 0 附近 = peer 报的是"它自己那个容器/岛"里的局部坐标，两套口径差一个窗口原点，必须换算；
+//pk=0 = 这颗按钮根本没有 automation peer，屏幕口径这条路在这台机器上直接不通，只能换 XAML 那套（xywh）；
+//hr!=0 = 问一次抛一次，记下错误码。
+static constexpr const wchar_t* kRegPeerEvidence = L"TaskbarSplitPeerEvidence"; //REG_SZ 屏幕口径失灵的原始证据，见上面那段读法
 static constexpr const wchar_t* kRegBuild = L"TaskbarSplitBuild";       //REG_SZ 助手 DLL 的编译时间戳。
                                                                         //explorer 里可能还挂着上一版的镜像（文件换了、进程没换），看这一行就知道正在跑的到底是哪一版
 static constexpr const wchar_t* kRegStep = L"TaskbarSplitStep";         //REG_DWORD 助手走到哪一步了（见下面的 kStep*），插件选项对话框直接显示这句话

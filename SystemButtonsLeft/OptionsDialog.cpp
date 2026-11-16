@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-12 14:20:34 +08:00
+// Last Modified At: 2026-11-16 12:23:45 +08:00
 #include "framework.h"
 #include <cstdio>
 #include <cwchar>
@@ -52,7 +52,11 @@ static const wchar_t* HelperStepText(int step)
 static void RefreshStatusLines(HWND hDlg)
 {
     const SplitStatus& st = CTaskbarSplitController::Instance().Status();
-    wchar_t buf[256];
+    //640：第 8 行要把助手那一整行 TaskbarSplitEdges 原样贴出来，而它已经涨到 300 多个字符
+    //（四格 + ev/vis/aw/why/pv/pw/ld/ms + dw 四档 + ws/wp/wl/wb + wr）。
+    //swprintf_s 拿到数组走的是模板重载，写不下不是截断而是直接终止进程 —— 那是插件把 TM 带崩，
+    //比少看几个字严重得多，所以这里必须比助手那侧的缓冲区（512）更大，加上"按钮右边界："那段前缀。
+    wchar_t buf[640];
 
     if (st.windows11)
         ::swprintf_s(buf, L"系统：Windows 11，支持拆分");
@@ -107,10 +111,11 @@ static void RefreshStatusLines(HWND hDlg)
         ::swprintf_s(buf, L"窗口跟随：还没挂上（任务栏窗口打开后本体下一次刷新就挂）");
     SetStatusLine(hDlg, IDC_STATUS_LINE7, buf);
 
-    //256 个 wchar：助手那一行加到 why=/pv=/pw=/ld/ms/dw= 以后最长约 140 字符，128 看着够，
-    //但 n= 那几个计数涨到四位数就顶边了 —— 读不下时 SplitRegReadString 直接失败，
+    //512 个 wchar：助手那一行从 why=/pv=/pw= 一路加到 dw= 四档 + ws/wp/wl/wb + wr=，
+    //每个数取满六位估就已经超过 300 —— 读不下时 SplitRegReadString 直接失败，
     //界面显示"助手还没报上来"，那是假象（助手明明在报），害人多猜一轮。
-    wchar_t edges[256]{};
+    //助手那边写进的缓冲区也是 512（TaskbarSplit.cpp 的 PublishEdges），两边必须一致。
+    wchar_t edges[512]{};
     if (SplitRegReadString(kRegEdges, edges, sizeof(edges) / sizeof(edges[0])) && edges[0] != L'\0')
         ::swprintf_s(buf, L"按钮右边界：%s", edges);
     else
