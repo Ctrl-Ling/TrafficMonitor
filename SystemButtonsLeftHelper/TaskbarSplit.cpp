@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-19 10:47:11 +08:00
+// Last Modified At: 2026-11-19 11:06:02 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -1073,7 +1073,8 @@ static long g_app_group_calib{ 0 };            //这个平移量成功量到几�
 //一按下去图标就跳回账本里的位置，顺序自然拖不动。
 //把同一个偏移下在容器自己的转发矩形上，容器里面的一切坐标原封不动：账本、命中测试、拖拽、气泡全跟着容器走，
 //居中这一刀照旧生效，而"屏幕位置和账本不一致"这件事从根上没有了。
-static std::vector<winrt::weak_ref<FrameworkElement>> g_app_group_hosts;   //认中过的容器（每趟只比引用，不再翻子树）
+static std::vector<winrt::weak_ref<FrameworkElement>> g_app_group_hosts;   //认中过的容器（每趟只比 abi，不再翻子树）
+static std::vector<void*> g_app_group_host_abi;                              //和上面那张表一一对应的 abi（防地址复用把新容器认成旧的那层）
 static bool g_app_host_shift_applied{ false };   //这一趟的偏移是下在容器上的（true 时按钮自己不再挪）
 static long g_app_host_arrange_count{ 0 };       //容器被排版过几次（认"这一趟容器还在不在"）
 static long g_app_host_arrange_snapshot{ 0 };    //上一次认趟时的容器次数快照（和上面那个数同类型，别在赋值时收窄）
@@ -1124,10 +1125,23 @@ static bool IsAppIconButton(std::wstring const& class_name)
 //类名由调用方给（CenterAppGroup 那里已经取过一次，别为同一个元素再问一遍）。
 static bool IsAppGroupHost(FrameworkElement const& element, std::wstring const& name)
 {
-    for (auto const& weak : g_app_group_hosts)
+    //名单里比的是"同一个实例"：弱引用 get() 出来的对象和传进来的比 abi，光比引用不够——
+    //元素回收后新对象可能复用旧地址（g_widgets_watched_abi 那一套教训，这里是同一件事）。
+    //容器每一趟都要排一次，这里一次比完就走，不再往下翻子树。
+    void* const abi = winrt::get_abi(element);
+    for (size_t i = 0; i < g_app_group_hosts.size(); i++)
     {
-        if (weak.get() == element)
-            return true;
+        if (g_app_group_host_abi[i] != abi)
+            continue;
+        try
+        {
+            auto alive = g_app_group_hosts[i].get();
+            if (alive && winrt::get_abi(alive) == abi)
+                return true;
+        }
+        catch (...)
+        {
+        }
     }
 
     bool named = false;
@@ -1147,11 +1161,20 @@ static bool IsAppGroupHost(FrameworkElement const& element, std::wstring const& 
             auto child = xaml_media::VisualTreeHelper::GetChild(element, i).try_as<FrameworkElement>();
             if (!child)
                 continue;
-            if (IsAppIconButton(get_class_name(child)))
+            //get_class_name 给的是 winrt::hstring：它能"赋值给 std::wstring"（C++17 那条模板赋值），
+            //但直接塞进收 std::wstring const& 的函数参数就编不过（error C2664，要两级用户定义转换）。
+            //先落一个 wstring 再问，和 CenterAppGroup 里那句 class_name = get_class_name(element) 同一个写法。
+            const std::wstring child_name = get_class_name(child);
+            if (IsAppIconButton(child_name))
             {
                 g_app_group_hosts.push_back(winrt::weak_ref<FrameworkElement>{ element });
+                g_app_group_host_abi.push_back(abi);
                 if (g_app_group_hosts.size() > 8)
-                    g_app_group_hosts.erase(g_app_group_hosts.begin());   //只留最近这几层，别攒成一堆死引用
+                {
+                    //只留最近这几层，别攒成一堆死引用；两张表一起丢头，保持一一对应
+                    g_app_group_hosts.erase(g_app_group_hosts.begin());
+                    g_app_group_host_abi.erase(g_app_group_host_abi.begin());
+                }
                 return true;
             }
         }
@@ -1466,6 +1489,7 @@ static void ResetAppGroupAccounting()
     g_app_host_rect_x_dip = 0.0;
     g_app_host_rect_w_dip = 0.0;
     g_app_group_hosts.clear();
+    g_app_group_host_abi.clear();
     //小组件那一刀和居中那一刀是同一批下出去的，清零必须一起清：
     //留着旧平移，下次开启第一帧就按"已经钉过去了"的位置再钉一次，整颗按钮往左多跑一格。
     g_widgets_shift_dip = 0.0;
