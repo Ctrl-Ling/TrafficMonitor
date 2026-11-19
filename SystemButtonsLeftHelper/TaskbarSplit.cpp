@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-19 11:06:02 +08:00
+// Last Modified At: 2026-11-19 15:06:24 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -1161,10 +1161,13 @@ static bool IsAppGroupHost(FrameworkElement const& element, std::wstring const& 
             auto child = xaml_media::VisualTreeHelper::GetChild(element, i).try_as<FrameworkElement>();
             if (!child)
                 continue;
-            //get_class_name 给的是 winrt::hstring：它能"赋值给 std::wstring"（C++17 那条模板赋值），
-            //但直接塞进收 std::wstring const& 的函数参数就编不过（error C2664，要两级用户定义转换）。
-            //先落一个 wstring 再问，和 CenterAppGroup 里那句 class_name = get_class_name(element) 同一个写法。
-            const std::wstring child_name = get_class_name(child);
+            //get_class_name 给的是 winrt::hstring，这层类型只能"赋值"进 std::wstring，两种直接写法都编不过：
+            //  · IsAppIconButton(get_class_name(child))            -> error C2664（绑到 wstring const& 形参要两级用户定义转换）
+            //  · const std::wstring n = get_class_name(child);     -> error C2440（拷贝初始化同样两级，构造函数够不着）
+            //  · std::wstring n = get_class_name(child);            -> error C2440（MSVC 把这句也归到"初始化"，不是赋值）
+            //唯一在这台 CI 上过的写法就是本文件 CenterAppGroup 里那句老写法：先声明、再赋值（走模板 operator=，内部自己转 view_type）。
+            std::wstring child_name;
+            child_name = get_class_name(child);
             if (IsAppIconButton(child_name))
             {
                 g_app_group_hosts.push_back(winrt::weak_ref<FrameworkElement>{ element });
