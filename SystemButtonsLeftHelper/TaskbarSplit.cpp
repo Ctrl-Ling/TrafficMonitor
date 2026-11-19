@@ -1,6 +1,6 @@
 ﻿// Author: Ctrl-Ling
 // Last Modified By: Ctrl-Ling
-// Last Modified At: 2026-11-16 15:09:14 +08:00
+// Last Modified At: 2026-11-19 10:47:11 +08:00
 #include "framework.h"
 #include "TaskbarSplit.h"
 #include "detour.h"
@@ -1041,6 +1041,8 @@ static void PublishClasses()
 //白名单必须由片4 报上去的 TaskbarSplitClasses 现场确认：
 //一个都没命中时 AppGroup 那行是 match=0，一次偏移都不会下（宁可不居中，也别把托盘时钟排歪）。
 static constexpr const wchar_t* kAppIconClasses[] = { L"Taskbar.TaskListButton" };
+//应用按钮共同的容器那一层（现场：Classes 里按钮的 p= 就是它）。见 IsAppGroupHost 为什么还要再看一眼孩子。
+static constexpr const wchar_t* kAppGroupHostClasses[] = { L"Microsoft.UI.Xaml.Controls.ItemsRepeater" };
 
 //只在任务栏线程访问（Arrange 全在那条线程上），不做原子：这些数一次读一次写都在同一趟里。
 static double g_app_sweep_min_dip{ 0.0 };      //这一趟里最左的 X
@@ -1062,6 +1064,21 @@ static long g_app_group_too_wide{ 0 };         //因为"宽得不像一个按钮
 static long g_app_group_phantom{ 0 };          //ItemsRepeater 回收/虚拟化时那种"负坐标或零宽"的幽灵排布，被挡掉的次数
 static double g_app_group_offset_dip{ 0.0 };   //排版矩形的 X 到屏幕左沿的平移量（父容器自己在任务栏里偏右多少）
 static long g_app_group_calib{ 0 };            //这个平移量成功量到几次（0 = peer 一直不认，整组只能按老口径居中）
+
+//【11-19：刀从"每颗按钮"挪到"装着按钮的那一层"】
+//他报的新毛病：「任务栏居中的图标，拖动时会跳动到左边，无法拖动图标位置」。
+//病根就是偏移下在每颗按钮自己的转发矩形上：屏幕上的图标被我们挪到 548，
+//可 ItemsRepeater 内部那套"第几项在容器里的第几 DIP"的账本一点没动，
+//拖拽重排用的正是那本账（它拿指针位置换算该插到第几颗），账本说这一颗在 143、眼睛看见它在 548，
+//一按下去图标就跳回账本里的位置，顺序自然拖不动。
+//把同一个偏移下在容器自己的转发矩形上，容器里面的一切坐标原封不动：账本、命中测试、拖拽、气泡全跟着容器走，
+//居中这一刀照旧生效，而"屏幕位置和账本不一致"这件事从根上没有了。
+static std::vector<winrt::weak_ref<FrameworkElement>> g_app_group_hosts;   //认中过的容器（每趟只比引用，不再翻子树）
+static bool g_app_host_shift_applied{ false };   //这一趟的偏移是下在容器上的（true 时按钮自己不再挪）
+static long g_app_host_arrange_count{ 0 };       //容器被排版过几次（认"这一趟容器还在不在"）
+static long g_app_host_arrange_snapshot{ 0 };    //上一次认趟时的容器次数快照（和上面那个数同类型，别在赋值时收窄）
+static double g_app_host_rect_x_dip{ 0.0 };      //容器自己的排版矩形（诊断 hx=/hw=，第一次现场要靠它对账）
+static double g_app_host_rect_w_dip{ 0.0 };
 
 //最左那颗应用按钮在屏幕上的真实左沿（DIP，相对任务栏左沿）。
 //为什么非要用屏幕口径量这一次：交给挂钩的 rect.X 是排版矩形的坐标，也就是"父容器那一层"的坐标，
@@ -1098,6 +1115,80 @@ static bool IsAppIconButton(std::wstring const& class_name)
     return false;
 }
 
+//装着应用按钮的那一层（Classes 的 p= 已经确认 = Microsoft.UI.Xaml.Controls.ItemsRepeater）。
+//名单只当嫌疑犯名单：真正认中的条件是"它肚子里至少有一颗 Taskbar.TaskListButton"。
+//为什么要这个条件：这一族的名字在任务栏里不止一处（缩略图列表那层也叫 ItemsRepeater），
+//认错一层就会把那层连着别的东西一起挪走；而"是不是应用按钮的家"这件事，看一眼孩子就知道。
+//认中一次就把引用记进 g_app_group_hosts，以后每趟只比引用——get_class_name 是一次 WinRT 调用，
+//容器每一趟都要排一次，不能每趟再把它肚子里翻一遍。
+//类名由调用方给（CenterAppGroup 那里已经取过一次，别为同一个元素再问一遍）。
+static bool IsAppGroupHost(FrameworkElement const& element, std::wstring const& name)
+{
+    for (auto const& weak : g_app_group_hosts)
+    {
+        if (weak.get() == element)
+            return true;
+    }
+
+    bool named = false;
+    for (auto const candidate : kAppGroupHostClasses)
+    {
+        if (name == candidate)
+            named = true;
+    }
+    if (!named)
+        return false;
+
+    try
+    {
+        const int count = xaml_media::VisualTreeHelper::GetChildrenCount(element);
+        for (int i = 0; i < count && i < 64; i++)
+        {
+            auto child = xaml_media::VisualTreeHelper::GetChild(element, i).try_as<FrameworkElement>();
+            if (!child)
+                continue;
+            if (IsAppIconButton(get_class_name(child)))
+            {
+                g_app_group_hosts.push_back(winrt::weak_ref<FrameworkElement>{ element });
+                if (g_app_group_hosts.size() > 8)
+                    g_app_group_hosts.erase(g_app_group_hosts.begin());   //只留最近这几层，别攒成一堆死引用
+                return true;
+            }
+        }
+    }
+    catch (...)
+    {
+    }
+    return false;
+}
+
+//把整组偏移下在容器自己的转发矩形上。返回 true = 这一趟的刀已经下在容器上了（按钮自己就不许再挪第二次）。
+//用的偏移就是按钮那一层原来算出来的那份（g_app_group_delta_dip），一点没换算法：
+//屏幕左沿 = 容器在根上的位置 + 按钮在容器里的 X，所以 目标 - (最左 X + 容器在根上的位置) 就是容器该挪的量，
+//"容器在根上的位置"正是校准量出来的 off（11-19 现场 off=37/100=0.37 DIP、cal=55 —— 这把尺子已经在正常工作，
+//整组屏幕左沿 143.57+404.43=548 和 peer 报的 548 一位不差，居中是准的）。
+//记账（sweep/off/cal）全部留在按钮那一层做：容器自己不知道组宽，也不需要知道。
+static bool ShiftAppGroupHost(FrameworkElement const& element, std::wstring const& name,
+    Rect rect, Rect* out_rect)
+{
+    if (g_app_group_count <= 0 || g_app_group_vertical)
+        return false;
+    if (!std::isfinite(g_app_group_delta_dip) || g_app_group_delta_dip == 0.0)
+        return false;
+    if (!IsAppGroupHost(element, name))
+        return false;
+
+    g_app_host_arrange_count++;
+    g_app_host_shift_applied = true;
+    g_app_host_rect_x_dip = static_cast<double>(rect.X);
+    g_app_host_rect_w_dip = static_cast<double>(rect.Width);
+
+    Rect shifted = rect;
+    shifted.X = static_cast<float>(static_cast<double>(rect.X) + g_app_group_delta_dip);
+    *out_rect = shifted;
+    return true;
+}
+
 //发布这一组的现场。为什么单独一行而不塞进 TaskbarSplitEdges：Edges 那行已经被四格 + 小组件判据占满，
 //而"居中没居中"是他一眼就能看出来的毛病，需要一行专门的答案：
 //match=0 是名字不对（下一步照 Classes 改名单），n=1 是只有一个窗口（那本来就没得居中），
@@ -1105,6 +1196,10 @@ static bool IsAppIconButton(std::wstring const& class_name)
 //lim= 是"这一趟真实排到的最右沿到面板边还剩多少"：d 被 lim 卡住（d≈lim 或 lim<=0）就说明
 //这一组比上一趟宽、正在往外冒，那一帧挤一下是故意的，飞出任务栏（图标整排看不见）才是事故。
 //off= 是"排版矩形的 X 到屏幕左沿的平移量"（父容器在任务栏里偏右多少），cal= 是它成功量到几趟。
+//hs= 是这一趟的刀下在哪一层：1=下在装着按钮的容器上（拖拽重排因此恢复正常），0=还是下在每颗按钮上。
+//hx=/hw= 是容器自己那次排版的矩形（DIP 坐标，父层那套），hc= 是容器被排版过几次：
+//这一组数第一次现场就要核对三件事——hs 是不是稳定 1、hx+hw 有没有越过面板边（越过说明容器被裁，图标会消失）、
+//cal 有没有在 hs=1 之后继续涨（不涨=按钮那层的记账断了，居中下一趟就没人算了）。
 //怎么用它判"居中偏了"：left 现在是屏幕口径，所以 left + width/2 + d 应当正好等于 panel/2，
 //对不上就是 off 没量到（cal=0 或 off=0）；屏幕上看着偏、但这三个数自洽，偏的量就是 off 缺的那一截。
 static void PublishAppGroup(double panel_dip)
@@ -1112,8 +1207,8 @@ static void PublishAppGroup(double panel_dip)
     if (g_app_group_match == 0)
         return;     //一个都没命中：别写一行全是 0 的数骗人去看，Classes 那行才是这一轮的正确答案
 
-    wchar_t buf[256]{};
-    ::swprintf_s(buf, L"n=%d left=%d width=%d panel=%d d=%d lim=%d off=%d cal=%d sz=%d wide=%d ph=%d axis=%s",
+    wchar_t buf[512]{};
+    ::swprintf_s(buf, L"n=%d left=%d width=%d panel=%d d=%d lim=%d off=%d cal=%d sz=%d wide=%d ph=%d axis=%s hs=%d hx=%d hw=%d hc=%d",
         g_app_group_count,
         static_cast<int>(std::lround(g_app_group_left_dip * 100.0)),
         static_cast<int>(std::lround((g_app_group_right_dip - g_app_group_left_dip) * 100.0)),
@@ -1125,7 +1220,11 @@ static void PublishAppGroup(double panel_dip)
         static_cast<int>(std::lround(g_app_group_size_dip * 100.0)),
         static_cast<int>(g_app_group_too_wide),
         static_cast<int>(g_app_group_phantom),
-        g_app_group_vertical ? L"v" : L"h");
+        g_app_group_vertical ? L"v" : L"h",
+        g_app_host_shift_applied ? 1 : 0,
+        static_cast<int>(std::lround(g_app_host_rect_x_dip * 100.0)),
+        static_cast<int>(std::lround(g_app_host_rect_w_dip * 100.0)),
+        static_cast<int>(g_app_host_arrange_count));
 
     //拼好的串和上次一模一样就不进注册表：SplitRegWriteStringIfChanged 是"每次调用都开一次键查一遍"，
     //而应用按钮每个都要排一次，一帧就是几十个按钮 —— 省掉那次查询比省掉那次写入更要紧。
@@ -1149,6 +1248,13 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
     {
         return false;
     }
+    //【同一个函数管两层】容器进来时，整组偏移加在容器自己的转发矩形上就交差；
+    //为什么必须放在 IsAppIconButton 之前：容器不叫 TaskListButton，走到下面那句就被"不是应用图标"退掉了。
+    //拖拽重排跳左边这一整类毛病就是这么来的：偏移下在每颗按钮上时，容器内部那本"第几项在第几 DIP"的账
+    //和屏幕上的位置不一致，拖拽按账本落位、眼睛看着在右边（见上面 g_app_group_hosts 那一段）。
+    if (ShiftAppGroupHost(element, class_name, rect, out_rect))
+        return true;
+
     if (!IsAppIconButton(class_name))
         return false;
 
@@ -1216,6 +1322,15 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
 
     if (!g_app_sweep_open || pos <= g_app_sweep_last_pos_dip)
     {
+        //【刀在容器上还是刀在按钮上，每趟在这里换班一次】容器一定在它孩子们之前排版，
+        //所以走到"新一趟第一个按钮"时，这一趟容器排没排是已经定下来的事实：
+        //排过 → 偏移由容器那一层扛着，按钮自己一个像素都不许再挪（挪两次就是屏幕上错开一整个偏移）；
+        //没排过（容器没了/换层了）→ 退回老办法，刀下回每颗按钮，居中不能因为换层而失效。
+        const bool host_arranged_this_pass = (g_app_host_arrange_count != g_app_host_arrange_snapshot);
+        if (!host_arranged_this_pass)
+            g_app_host_shift_applied = false;
+        g_app_host_arrange_snapshot = g_app_host_arrange_count;
+
         //新一趟开始：先把上一趟的结果交出来当这一趟的偏移依据。
         //判据用"这一次的位置不比上一个靠左"：同一趟里按钮一定是一个比一个靠右（或靠下），
         //位置倒退就是系统重新排了一整趟。用 <= 而不是 <，是因为关掉几个应用之后
@@ -1305,6 +1420,13 @@ static bool CenterAppGroup(FrameworkElement const& element, Rect rect, Rect* out
     g_app_group_delta_dip = delta;
     PublishAppGroup(panel_dip);
 
+    if (g_app_host_shift_applied)
+    {
+        //这一趟的偏移由容器那一层整体扛着（ShiftAppGroupHost），按钮这层只负责记账，一个像素都不再挪：
+        //两层都挪就是挪两遍，整组会直接跑到面板外面。
+        return true;
+    }
+
     if (delta <= 0.0)
         return true;          //是应用图标，但这一趟不挪
 
@@ -1336,6 +1458,14 @@ static void ResetAppGroupAccounting()
     g_app_group_limit_dip = 0.0;
     g_app_group_offset_dip = 0.0;
     g_app_group_calib = 0;
+    //容器那一层的记账一起清：偏移只写在转发矩形里，容器下一帧拿到的就是系统自己那份 X，
+    //屏幕上自己就回去了；这里清的是"刀下在哪一层"和认中的容器名单，省得下次开启第一帧拿着旧状态。
+    g_app_host_shift_applied = false;
+    g_app_host_arrange_count = 0;
+    g_app_host_arrange_snapshot = 0;
+    g_app_host_rect_x_dip = 0.0;
+    g_app_host_rect_w_dip = 0.0;
+    g_app_group_hosts.clear();
     //小组件那一刀和居中那一刀是同一批下出去的，清零必须一起清：
     //留着旧平移，下次开启第一帧就按"已经钉过去了"的位置再钉一次，整颗按钮往左多跑一格。
     g_widgets_shift_dip = 0.0;
